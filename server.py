@@ -140,6 +140,16 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.handle_sse_stream()
             return
 
+        # 1b. Live Sync Snapshot (used by serverless / fallback clients)
+        if path == '/api/live-sync':
+            self.send_json_response(200, {
+                'orders': list_orders(limit=100),
+                'stats': get_stats(),
+                'queue_summary': get_active_queue_summary(),
+                'detailed_queue': get_detailed_queue_items()
+            })
+            return
+
         # 2. REST API: List Orders
         if path == '/api/orders':
             status = query.get('status', [None])[0]

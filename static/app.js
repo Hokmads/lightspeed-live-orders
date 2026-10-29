@@ -196,11 +196,63 @@ function initSSE() {
   };
 }
 
+let liveSyncInterval = null;
+
+function startServerlessLiveSync() {
+  if (liveSyncInterval) return;
+  const statusBadge = document.getElementById('live-status-badge');
+  const statusText = document.getElementById('live-status-text');
+  if (statusBadge) statusBadge.className = 'live-badge';
+  if (statusText) statusText.textContent = 'LIVE STREAMING';
+
+  liveSyncInterval = setInterval(async () => {
+    try {
+      const res = await fetch('/api/live-sync');
+      if (!res.ok) return;
+      const syncData = await res.json();
+      if (statusBadge) statusBadge.className = 'live-badge';
+      if (statusText) statusText.textContent = 'LIVE STREAMING';
+
+      if (Array.isArray(syncData.orders)) {
+        const currentIds = new Set(orders.map(o => o.id));
+        const newIncoming = syncData.orders.filter(o => !currentIds.has(o.id));
+        orders = syncData.orders;
+        if (newIncoming.length > 0) {
+          const newest = newIncoming[0];
+          playOrderChime();
+          showToast(`New Order ${newest.order_number} received! (${formatCurrency(newest.total)})`, 'success');
+          renderOrders(newest.id);
+        } else {
+          renderOrders();
+        }
+      }
+      if (syncData.stats) {
+        updateStatsUI(syncData.stats);
+      }
+      if (syncData.queue_summary) {
+        renderQueueSummaryUI(syncData.queue_summary);
+      }
+      if (syncData.detailed_queue) {
+        detailedQueueItems = syncData.detailed_queue;
+        updateStationBadge();
+        if (currentMainView === 'items') renderItemsStation();
+      }
+    } catch (err) {
+      // Quietly retry on next tick
+    }
+  }, 3000);
+}
+
 // Dispatch incoming SSE events
 function handleServerEvent(payload) {
   const { type, data } = payload;
 
   if (type === 'connected') {
+    if (payload.serverless && eventSource) {
+      eventSource.close();
+      eventSource = null;
+      startServerlessLiveSync();
+    }
     fetchStats();
     if (payload.queue_summary) {
       renderQueueSummaryUI(payload.queue_summary);
@@ -725,6 +777,10 @@ async function simulateOrder() {
   try {
     const res = await fetch('/api/simulate-order', { method: 'POST' });
     if (res.ok) {
+      const data = await res.json();
+      if (data && data.order) {
+        handleServerEvent({ type: 'new_order', data: data.order });
+      }
       showToast('Simulated Lightspeed order triggered!', 'info');
     }
   } catch (err) {
@@ -736,7 +792,10 @@ async function simulateOrder() {
 async function clearAllOrders() {
   if (!confirm("Are you sure you want to clear all orders from this screen?\n\n🛡️ LOCAL ONLY: This only clears the local dashboard/demo orders. It will NEVER delete, cancel, or alter sales in Lightspeed POS.")) return;
   try {
-    await fetch('/api/orders/clear', { method: 'POST' });
+    const res = await fetch('/api/orders/clear', { method: 'POST' });
+    if (res.ok) {
+      handleServerEvent({ type: 'orders_cleared' });
+    }
   } catch (err) {
     console.error("Failed to clear orders:", err);
   }
