@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f172a">
   <title>Lightspeed Live Orders Dashboard</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22%20%220%22%20%22100%22%20%22100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
@@ -47,6 +50,15 @@
       </button>
     </div>
   </header>
+
+  <!-- Mobile Audio Unlock Hint Banner (iOS Safari Web Audio unlock) -->
+  <div id="mobile-audio-banner" class="mobile-audio-banner" onclick="unlockAudioForMobile()" style="display: none;">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <span>🔔</span>
+      <span>Tap anywhere to enable sound alerts on this iPad / iPhone</span>
+    </div>
+    <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 11px;">Enable Sound</button>
+  </div>
 
   <!-- Live Stats KPI Bar -->
   <section class="stats-container">

@@ -28,6 +28,49 @@ function getAudioContext() {
   return audioCtx;
 }
 
+// Unlock Web Audio on iOS Safari / iPadOS
+function unlockAudioForMobile() {
+  const ctx = getAudioContext();
+  if (!ctx) return;
+
+  if (ctx.state === 'suspended') {
+    ctx.resume().then(() => {
+      hideAudioBanner();
+      showToast('Sound alerts enabled for this device', 'success');
+    }).catch(e => console.warn("Could not resume audio:", e));
+  } else {
+    hideAudioBanner();
+  }
+
+  // Play a silent 0.01s buffer to unlock iOS hardware mute
+  try {
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    source.start(0);
+  } catch (err) {}
+}
+
+function hideAudioBanner() {
+  const banner = document.getElementById('mobile-audio-banner');
+  if (banner) banner.style.display = 'none';
+}
+
+function checkMobileAudio() {
+  // Show prompt if on touch device / iOS and audio is suspended
+  const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+  if (isTouchDevice && isSoundEnabled) {
+    const banner = document.getElementById('mobile-audio-banner');
+    if (banner) {
+      const ctx = getAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        banner.style.display = 'flex';
+      }
+    }
+  }
+}
+
 // Play a pleasant two-tone order notification bell
 function playOrderChime() {
   if (!isSoundEnabled) return;
@@ -765,4 +808,14 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   });
+
+  // Mobile / iPad auto-unlock for Web Audio on first user interaction
+  const unlockEvents = ['touchstart', 'touchend', 'click', 'keydown'];
+  unlockEvents.forEach(evt => {
+    document.addEventListener(evt, () => {
+      unlockAudioForMobile();
+    }, { once: true, passive: true });
+  });
+
+  setTimeout(checkMobileAudio, 800);
 });

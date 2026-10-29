@@ -713,21 +713,211 @@ header {
   to { transform: translateX(0); opacity: 1; }
 }
 
-/* Responsive adjustments */
-@media (max-width: 768px) {
+/* Mobile Audio Banner */
+.mobile-audio-banner {
+  background: linear-gradient(90deg, #1e3a8a 0%, #1e40af 100%);
+  color: #bfdbfe;
+  padding: 10px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 500;
+  border-bottom: 1px solid rgba(59, 130, 246, 0.3);
+  cursor: pointer;
+  animation: pulseBanner 2s infinite;
+}
+
+@keyframes pulseBanner {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.85; }
+}
+
+/* Tablet & iPad Specific Styles (Portrait and Landscape: 601px - 1024px) */
+@media (max-width: 1024px) {
   header {
-    padding: 12px 16px;
+    padding: 12px 20px;
   }
   .stats-container {
-    padding: 16px 16px 8px 16px;
+    padding: 16px 20px 8px 20px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
   }
   .controls-bar {
-    padding: 8px 16px;
+    padding: 10px 20px;
   }
   .content-area {
-    padding: 8px 16px;
+    padding: 10px 20px 30px 20px;
   }
+  .orders-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+}
+
+/* Mobile Phones (< 768px) */
+@media (max-width: 768px) {
+  body {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  header {
+    padding: 12px 14px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .header-actions .btn,
+  .header-actions .live-badge {
+    flex: 1 1 auto;
+    justify-content: center;
+    font-size: 12px;
+    padding: 8px 10px;
+    min-height: 40px;
+    touch-action: manipulation;
+  }
+
+  .stats-container {
+    padding: 12px 14px 6px 14px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+
+  .stat-card {
+    padding: 12px 14px;
+  }
+
+  .stat-value {
+    font-size: 22px;
+  }
+
+  .controls-bar {
+    padding: 8px 14px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .filter-tabs {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 4px;
+    display: flex;
+  }
+
+  .filter-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab-btn {
+    flex-shrink: 0;
+    padding: 8px 14px;
+    font-size: 13px;
+    min-height: 40px;
+  }
+
+  .search-and-view {
+    width: 100%;
+  }
+
   .search-box {
+    width: 100%;
+  }
+
+  .search-box input {
+    padding: 10px 12px 10px 36px;
+    font-size: 14px; /* Prevents auto-zoom on iOS Safari */
+    min-height: 44px;
+  }
+
+  .content-area {
+    padding: 8px 14px 40px 14px;
+  }
+
+  .orders-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .order-card-header {
+    padding: 14px 16px;
+  }
+
+  .order-card-body {
+    padding: 14px 16px;
+  }
+
+  .order-card-footer {
+    padding: 12px 16px;
+  }
+
+  .action-btn-mini {
+    padding: 10px 14px;
+    font-size: 13px;
+    min-height: 42px; /* iOS Human Interface Target */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Bottom-Sheet Style Modal for Phones */
+  .modal-overlay {
+    padding: 0;
+    align-items: flex-end;
+  }
+
+  .modal-card {
+    border-radius: 20px 20px 0 0;
+    max-height: 88vh;
+    border-bottom: none;
+    animation: slideUpMobile 0.25s ease-out;
+  }
+
+  @keyframes slideUpMobile {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+
+  .modal-header {
+    padding: 16px 20px;
+  }
+
+  .modal-body {
+    padding: 18px 20px;
+    gap: 16px;
+  }
+
+  .modal-footer {
+    padding: 14px 20px;
+    padding-bottom: max(14px, env(safe-area-inset-bottom));
+    flex-wrap: wrap;
+  }
+
+  .modal-footer .btn {
+    flex: 1 1 calc(50% - 6px);
+    justify-content: center;
+    min-height: 44px;
+  }
+
+  #toast-container {
+    left: 14px;
+    right: 14px;
+    bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .toast {
+    min-width: 0;
     width: 100%;
   }
 }
