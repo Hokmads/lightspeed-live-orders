@@ -9,9 +9,13 @@ let orders = [];
 let currentFilter = 'all';
 let searchQuery = '';
 let currentView = 'cards';
+let currentMainView = 'orders'; // 'orders' or 'items'
 let isSoundEnabled = localStorage.getItem('ls_sound_enabled') !== 'false';
 let eventSource = null;
 let currentModalOrderId = null;
+let selectedQueueItem = null;
+let activeQueueItems = [];
+let detailedQueueItems = [];
 
 // Initialize Web Audio Context
 let audioCtx = null;
@@ -198,11 +202,20 @@ function handleServerEvent(payload) {
 
   if (type === 'connected') {
     fetchStats();
+    if (payload.queue_summary) {
+      renderQueueSummaryUI(payload.queue_summary);
+    } else {
+      computeQueueSummary();
+    }
+    if (payload.detailed_queue) {
+      detailedQueueItems = payload.detailed_queue;
+      updateStationBadge();
+      if (currentMainView === 'items') renderItemsStation();
+    }
     return;
   }
 
   if (type === 'new_order') {
-    // Add to orders list at front
     const exists = orders.some(o => o.id === data.id);
     if (!exists) {
       orders.unshift(data);
@@ -210,6 +223,8 @@ function handleServerEvent(payload) {
       showToast(`New Order ${data.order_number} received! (${formatCurrency(data.total)})`, 'success');
       renderOrders(data.id);
       fetchStats();
+      computeQueueSummary();
+      fetchDetailedQueueItems();
     }
     return;
   }
@@ -223,6 +238,8 @@ function handleServerEvent(payload) {
     }
     renderOrders();
     fetchStats();
+    computeQueueSummary();
+    fetchDetailedQueueItems();
     if (currentModalOrderId === data.id) {
       renderOrderModal(data);
     }
@@ -231,9 +248,25 @@ function handleServerEvent(payload) {
 
   if (type === 'orders_cleared') {
     orders = [];
+    detailedQueueItems = [];
     renderOrders();
     fetchStats();
+    renderQueueSummaryUI([]);
+    updateStationBadge();
+    if (currentMainView === 'items') renderItemsStation();
     showToast('All orders cleared.', 'info');
+    return;
+  }
+
+  if (type === 'queue_updated') {
+    renderQueueSummaryUI(data);
+    return;
+  }
+
+  if (type === 'detailed_queue_updated') {
+    detailedQueueItems = data || [];
+    updateStationBadge();
+    if (currentMainView === 'items') renderItemsStation();
     return;
   }
 
@@ -249,6 +282,8 @@ async function fetchOrders() {
     const data = await res.json();
     orders = data.orders || [];
     renderOrders();
+    computeQueueSummary();
+    fetchDetailedQueueItems();
   } catch (err) {
     console.error("Failed to fetch orders:", err);
   }
@@ -285,9 +320,90 @@ function updateStatsUI(stats) {
   document.getElementById('tab-count-completed').textContent = completedCount;
 }
 
+// Compute Kitchen Item Queue Summary from active orders ('new' and 'in_progress')
+function computeQueueSummary() {
+  const itemMap = {};
+  const activeOrders = orders.filter(o => o.status === 'new' || o.status === 'in_progress');
+  
+  for (const order of activeOrders) {
+    for (const item of (order.items || [])) {
+      const name = item.name || 'Item';
+      if (!itemMap[name]) {
+        itemMap[name] = { name: name, total_quantity: 0, order_ids: new Set() };
+      }
+      itemMap[name].total_quantity += parseInt(item.quantity || 1, 10);
+      itemMap[name].order_ids.add(order.id);
+    }
+  }
+
+  activeQueueItems = Object.values(itemMap).map(it => ({
+    name: it.name,
+    total_quantity: it.total_quantity,
+    order_count: it.order_ids.size
+  })).sort((a, b) => b.total_quantity - a.total_quantity);
+
+  renderQueueSummaryUI(activeQueueItems);
+}
+
+// Render the Kitchen Items Queue (All-Day bar)
+function renderQueueSummaryUI(items) {
+  const container = document.getElementById('queue-items-container');
+  const totalBadge = document.getElementById('queue-total-items-badge');
+  const clearBtn = document.getElementById('clear-item-filter-btn');
+  if (!container) return;
+
+  activeQueueItems = items || [];
+  const totalItemsCount = activeQueueItems.reduce((sum, it) => sum + (it.total_quantity || 0), 0);
+  if (totalBadge) {
+    totalBadge.textContent = `${totalItemsCount} to make`;
+  }
+
+  if (clearBtn) {
+    clearBtn.style.display = selectedQueueItem ? 'inline-block' : 'none';
+  }
+
+  if (!items || items.length === 0) {
+    container.innerHTML = `<span class="queue-empty-msg">No items in prep queue. All active orders completed!</span>`;
+    return;
+  }
+
+  container.innerHTML = items.map(it => {
+    const isSelected = selectedQueueItem === it.name ? 'active' : '';
+    const orderPlural = it.order_count === 1 ? 'order' : 'orders';
+    return `
+      <div class="queue-item-pill ${isSelected}" onclick="toggleQueueItemFilter('${escapeHtml(it.name)}')">
+        <span class="queue-item-qty">${it.total_quantity}×</span>
+        <span class="queue-item-name">${escapeHtml(it.name)}</span>
+        <span class="queue-item-orders">(${it.order_count} ${orderPlural})</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleQueueItemFilter(itemName) {
+  if (selectedQueueItem === itemName) {
+    selectedQueueItem = null;
+  } else {
+    selectedQueueItem = itemName;
+  }
+  renderQueueSummaryUI(activeQueueItems);
+  renderOrders();
+}
+
+function clearItemFilter() {
+  selectedQueueItem = null;
+  renderQueueSummaryUI(activeQueueItems);
+  renderOrders();
+}
+
 // Filter and search orders
 function getFilteredOrders() {
   return orders.filter(order => {
+    // Queue item filter (when clicked from Kitchen Queue bar)
+    if (selectedQueueItem) {
+      const hasItem = (order.items || []).some(it => it.name === selectedQueueItem);
+      if (!hasItem) return false;
+    }
     // Status filter
     if (currentFilter !== 'all' && order.status !== currentFilter) {
       return false;
@@ -336,32 +452,45 @@ function renderOrders(highlightId = null) {
     let actionButtons = '';
     if (order.status === 'new') {
       actionButtons = `
-        <button class="action-btn-mini btn-secondary" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'in_progress')">
-          ⏳ Start Prep
+        <button class="action-btn-mini btn-secondary" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'in_progress', false)">
+          ⏳ Prep
         </button>
-        <button class="action-btn-mini btn-success" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready')">
-          ✓ Mark Ready
+        <button class="action-btn-mini btn-local-ready" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready', false)" title="Mark Ready on dashboard only (Safe from POS)">
+          🛡️ Ready (Local)
+        </button>
+        <button class="action-btn-mini btn-api-ready" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready', true)" title="Mark Ready & Sync to Lightspeed POS API">
+          ☁️ Ready (API)
         </button>
       `;
     } else if (order.status === 'in_progress') {
       actionButtons = `
-        <button class="action-btn-mini btn-success" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready')">
-          ✓ Mark Ready
+        <button class="action-btn-mini btn-local-ready" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready', false)" title="Mark Ready on dashboard only (Safe from POS)">
+          🛡️ Ready (Local)
+        </button>
+        <button class="action-btn-mini btn-api-ready" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'ready', true)" title="Mark Ready & Sync to Lightspeed POS API">
+          ☁️ Ready (API)
         </button>
       `;
     } else if (order.status === 'ready') {
       actionButtons = `
-        <button class="action-btn-mini btn-primary" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'completed')">
-          🏁 Complete
+        <button class="action-btn-mini btn-local-complete" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'completed', false)" title="Complete on dashboard only (Safe from POS)">
+          🛡️ Complete (Local)
+        </button>
+        <button class="action-btn-mini btn-api-complete" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'completed', true)" title="Complete & Sync to Lightspeed POS API">
+          ☁️ Complete (API)
         </button>
       `;
     } else {
       actionButtons = `
-        <button class="action-btn-mini btn-secondary" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'new')">
+        <button class="action-btn-mini btn-secondary" onclick="event.stopPropagation(); updateOrderStatus('${order.id}', 'new', false)">
           ↩ Reopen
         </button>
       `;
     }
+
+    const syncBadge = order.synced_to_lightspeed
+      ? '<span class="sync-status-pill synced" title="Synced with Lightspeed API">☁️ Synced</span>'
+      : '<span class="sync-status-pill local" title="Local display only">🛡️ Local</span>';
 
     return `
       <div class="order-card ${isHighlighted}" onclick="openOrderModal('${order.id}')">
@@ -370,7 +499,10 @@ function renderOrders(highlightId = null) {
             <span class="order-number">${escapeHtml(order.order_number || order.id)}</span>
             <span class="order-time" data-timestamp="${order.created_at}">${formatTimeAgo(order.created_at)}</span>
           </div>
-          <span class="status-badge ${order.status}">${statusLabel}</span>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            ${syncBadge}
+            <span class="status-badge ${order.status}">${statusLabel}</span>
+          </div>
         </div>
 
         <div class="order-card-body">
@@ -397,7 +529,10 @@ function renderOrders(highlightId = null) {
         </div>
 
         <div class="order-card-footer">
-          <span class="total-amount">${formatCurrency(order.total, order.currency)}</span>
+          <div class="order-footer-price-row">
+            <span class="total-label">Total</span>
+            <span class="total-amount">${formatCurrency(order.total, order.currency)}</span>
+          </div>
           <div class="quick-action-btns">
             ${actionButtons}
           </div>
@@ -407,13 +542,13 @@ function renderOrders(highlightId = null) {
   }).join('');
 }
 
-// Update order status via REST API
-async function updateOrderStatus(orderId, newStatus) {
+// Update order status via REST API (supports syncToLightspeed: boolean)
+async function updateOrderStatus(orderId, newStatus, syncToLightspeed = false) {
   try {
     const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: newStatus })
+      body: JSON.stringify({ status: newStatus, sync_lightspeed: syncToLightspeed })
     });
     if (res.ok) {
       const data = await res.json();
@@ -422,6 +557,13 @@ async function updateOrderStatus(orderId, newStatus) {
         orders[idx] = data.order;
         renderOrders();
         fetchStats();
+        computeQueueSummary();
+      }
+      if (syncToLightspeed) {
+        const msg = data.api_result?.message || 'Updated & synced with Lightspeed API';
+        showToast(`☁️ ${msg}`, 'success');
+      } else {
+        showToast(`🛡️ Marked as ${newStatus.replace('_', ' ')} (Local only)`, 'info');
       }
     }
   } catch (err) {
@@ -521,10 +663,13 @@ function renderOrderModal(order) {
       </div>
     </div>
 
-    <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd; padding: 8px 12px; border-radius: var(--radius-md); font-size: 12px; display: flex; align-items: center; gap: 8px;">
-      <span>🛡️</span>
-      <div>
-        <strong>Local-Only Display Status:</strong> Marking this order as Prep, Ready, or Complete stays 100% on this dashboard. It does <u>not</u> alter, void, or change sales records in Lightspeed.
+    <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd; padding: 10px 14px; border-radius: var(--radius-md); font-size: 12px; display: flex; flex-direction: column; gap: 4px;">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
+        <strong>Sync Status: ${order.synced_to_lightspeed ? '☁️ Synced with Lightspeed API' : '🛡️ Local Display Only'}</strong>
+        <span class="sync-status-pill ${order.synced_to_lightspeed ? 'synced' : 'local'}">${order.synced_to_lightspeed ? 'API Synced' : 'Local Only'}</span>
+      </div>
+      <div style="color: var(--text-secondary); font-size: 11px;">
+        Use <strong>🛡️ (Local)</strong> buttons to mark order without affecting your Lightspeed POS records. Use <strong>☁️ (API)</strong> buttons to update status in Lightspeed.
       </div>
     </div>
 
@@ -541,10 +686,11 @@ function renderOrderModal(order) {
   const footer = document.getElementById('modal-order-footer');
   footer.innerHTML = `
     <button class="btn btn-secondary" onclick="window.print()">🖨️ Print Ticket</button>
-    <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'new'); closeOrderModal();">New</button>
-    <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'in_progress'); closeOrderModal();">⏳ Prep</button>
-    <button class="btn btn-success" onclick="updateOrderStatus('${order.id}', 'ready'); closeOrderModal();">✓ Ready</button>
-    <button class="btn btn-primary" onclick="updateOrderStatus('${order.id}', 'completed'); closeOrderModal();">🏁 Complete</button>
+    <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'in_progress', false); closeOrderModal();">⏳ Prep</button>
+    <button class="btn btn-local-ready" onclick="updateOrderStatus('${order.id}', 'ready', false); closeOrderModal();" title="Mark ready locally without touching Lightspeed">🛡️ Ready (Local)</button>
+    <button class="btn btn-api-ready" onclick="updateOrderStatus('${order.id}', 'ready', true); closeOrderModal();" title="Mark ready & sync to Lightspeed API">☁️ Ready (API)</button>
+    <button class="btn btn-local-complete" onclick="updateOrderStatus('${order.id}', 'completed', false); closeOrderModal();" title="Complete locally without touching Lightspeed">🛡️ Complete (Local)</button>
+    <button class="btn btn-api-complete" onclick="updateOrderStatus('${order.id}', 'completed', true); closeOrderModal();" title="Complete & sync to Lightspeed API">☁️ Complete (API)</button>
   `;
 }
 
@@ -586,9 +732,9 @@ async function simulateOrder() {
   }
 }
 
-// Clear Orders
+// Clear Orders (Local only - never calls or modifies Lightspeed POS)
 async function clearAllOrders() {
-  if (!confirm("Are you sure you want to clear all orders?")) return;
+  if (!confirm("Are you sure you want to clear all orders from this screen?\n\n🛡️ LOCAL ONLY: This only clears the local dashboard/demo orders. It will NEVER delete, cancel, or alter sales in Lightspeed POS.")) return;
   try {
     await fetch('/api/orders/clear', { method: 'POST' });
   } catch (err) {
@@ -756,9 +902,252 @@ function escapeHtml(text) {
     .replace(/'/g, '&#039;');
 }
 
+// Switch main view mode ('orders' vs 'items')
+function switchMainView(mode) {
+  currentMainView = mode;
+  const btnOrders = document.getElementById('btn-view-orders');
+  const btnItems = document.getElementById('btn-view-items');
+  const ordersFilterBar = document.getElementById('orders-status-filters');
+  const allDayBar = document.getElementById('all-day-bar-section');
+  const ordersContainer = document.getElementById('orders-container');
+  const itemsContainer = document.getElementById('items-station-container');
+
+  if (mode === 'items') {
+    if (btnOrders) btnOrders.classList.remove('active');
+    if (btnItems) btnItems.classList.add('active');
+    if (ordersFilterBar) ordersFilterBar.style.display = 'none';
+    if (allDayBar) allDayBar.style.display = 'none';
+    if (ordersContainer) ordersContainer.style.display = 'none';
+    if (itemsContainer) itemsContainer.style.display = 'grid';
+    renderItemsStation();
+  } else {
+    if (btnItems) btnItems.classList.remove('active');
+    if (btnOrders) btnOrders.classList.add('active');
+    if (ordersFilterBar) ordersFilterBar.style.display = 'flex';
+    if (allDayBar) allDayBar.style.display = 'block';
+    if (ordersContainer) ordersContainer.style.display = 'grid';
+    if (itemsContainer) itemsContainer.style.display = 'none';
+    renderOrders();
+  }
+}
+
+// Fetch detailed grouped queue items for the Items Queue station
+async function fetchDetailedQueueItems() {
+  try {
+    const res = await fetch('/api/detailed-queue-items');
+    if (res.ok) {
+      const data = await res.json();
+      detailedQueueItems = data.items || [];
+      updateStationBadge();
+      if (currentMainView === 'items') {
+        renderItemsStation();
+      }
+    }
+  } catch (err) {
+    console.error("Failed to fetch detailed queue items:", err);
+  }
+}
+
+// Update the station badge counter
+function updateStationBadge() {
+  const badge = document.getElementById('station-queue-badge');
+  if (!badge) return;
+  const pendingTotal = (detailedQueueItems || []).reduce((acc, it) => acc + (it.pending_quantity || 0), 0);
+  badge.textContent = pendingTotal;
+}
+
+// Render dedicated Items Queue Station view
+function renderItemsStation() {
+  const container = document.getElementById('items-station-container');
+  if (!container) return;
+
+  let items = detailedQueueItems || [];
+  if (searchQuery) {
+    const q = searchQuery.toLowerCase();
+    items = items.filter(it =>
+      (it.name && it.name.toLowerCase().includes(q)) ||
+      (it.sku && it.sku.toLowerCase().includes(q)) ||
+      (it.order_lines && it.order_lines.some(l =>
+        (l.order_number && String(l.order_number).toLowerCase().includes(q)) ||
+        (l.customer_name && l.customer_name.toLowerCase().includes(q)) ||
+        (l.modifiers && l.modifiers.toLowerCase().includes(q))
+      ))
+    );
+  }
+
+  if (items.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state" style="grid-column: 1 / -1;">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <h3>No Items In Queue</h3>
+        <p>All items in active orders have been made! New items will appear here automatically when orders arrive.</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = items.map(item => {
+    const pendingCount = item.pending_quantity || 0;
+    const madeCount = item.made_quantity || 0;
+    const totalCount = item.total_quantity || (pendingCount + madeCount);
+
+    const linesHtml = (item.order_lines || []).map(line => {
+      const isMade = line.item_status === 'made';
+      const syncBadge = isMade
+        ? (line.item_synced
+            ? '<span class="sync-status-pill synced" style="font-size: 10px; padding: 1px 6px;">☁️ Synced</span>'
+            : '<span class="sync-status-pill local" style="font-size: 10px; padding: 1px 6px;">🛡️ Local</span>')
+        : '';
+
+      const actionButtons = isMade ? `
+        <button class="action-btn-mini btn-secondary" onclick="updateItemStatus(${line.item_id}, 'pending', false)">
+          ↩ Reopen
+        </button>
+      ` : `
+        <button class="action-btn-mini btn-local-ready" onclick="updateItemStatus(${line.item_id}, 'made', false)" title="Mark item made on dashboard only">
+          🛡️ Made (Local)
+        </button>
+        <button class="action-btn-mini btn-api-ready" onclick="updateItemStatus(${line.item_id}, 'made', true)" title="Mark item made & sync to Lightspeed API">
+          ☁️ Made (API)
+        </button>
+      `;
+
+      return `
+        <li class="station-line-entry ${isMade ? 'is-made' : ''}">
+          <div class="station-line-top">
+            <div>
+              <span class="station-order-tag">${escapeHtml(line.order_number || ('#' + line.order_id))}</span>
+              <span class="station-cust-name">${escapeHtml(line.customer_name || 'Walk-in')}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              ${syncBadge}
+              <span class="station-line-qty">×${line.quantity}</span>
+            </div>
+          </div>
+          ${line.modifiers ? `<div class="station-modifiers">📝 ${escapeHtml(line.modifiers)}</div>` : ''}
+          <div class="station-line-actions">
+            ${actionButtons}
+          </div>
+        </li>
+      `;
+    }).join('');
+
+    const batchFooter = pendingCount > 0 ? `
+      <div class="station-item-footer">
+        <button class="action-btn-mini btn-local-ready" style="flex: 1; justify-content: center;" onclick="updateBatchItemStatus('${escapeHtml(item.name).replace(/'/g, "\\'")}', 'made', false)" title="Mark all ${pendingCount} made locally">
+          🛡️ All Made (Local)
+        </button>
+        <button class="action-btn-mini btn-api-ready" style="flex: 1; justify-content: center;" onclick="updateBatchItemStatus('${escapeHtml(item.name).replace(/'/g, "\\'")}', 'made', true)" title="Mark all ${pendingCount} made and sync API">
+          ☁️ All Made (API)
+        </button>
+      </div>
+    ` : `
+      <div class="station-item-footer" style="justify-content: center; color: var(--accent-emerald); font-size: 12px; font-weight: 700; padding: 10px;">
+        ✅ All ${totalCount} completed
+      </div>
+    `;
+
+    return `
+      <div class="station-item-card">
+        <div class="station-item-header">
+          <div>
+            <div class="station-item-title">${escapeHtml(item.name)}</div>
+            ${item.sku ? `<div class="station-item-sku">SKU: ${escapeHtml(item.sku)}</div>` : ''}
+          </div>
+          <div class="station-item-counts">
+            ${pendingCount > 0 ? `<span class="station-pending-badge">${pendingCount} TO MAKE</span>` : ''}
+            ${madeCount > 0 ? `<span class="station-made-badge">${madeCount} MADE</span>` : ''}
+          </div>
+        </div>
+
+        <ul class="station-lines-list">
+          ${linesHtml}
+        </ul>
+
+        ${batchFooter}
+      </div>
+    `;
+  }).join('');
+}
+
+// Update individual item status via API (Local or Lightspeed synced)
+async function updateItemStatus(itemId, newStatus, syncToLightspeed = false) {
+  try {
+    const res = await fetch(`/api/items/${encodeURIComponent(itemId)}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus, sync_lightspeed: syncToLightspeed })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.detailed_items) {
+        detailedQueueItems = data.detailed_items;
+        updateStationBadge();
+        if (currentMainView === 'items') {
+          renderItemsStation();
+        }
+      }
+      if (data.order) {
+        const idx = orders.findIndex(o => o.id === data.order.id);
+        if (idx !== -1) {
+          orders[idx] = data.order;
+        } else {
+          orders.unshift(data.order);
+        }
+        renderOrders();
+        fetchStats();
+        computeQueueSummary();
+      }
+      if (syncToLightspeed) {
+        const msg = data.api_result?.message || 'Item updated & synced with Lightspeed API';
+        showToast(`☁️ ${msg}`, 'success');
+      } else {
+        showToast(`🛡️ Item marked as ${newStatus} (Local only)`, 'info');
+      }
+    }
+  } catch (err) {
+    console.error("Failed to update item status:", err);
+    showToast("Failed to update item status", "error");
+  }
+}
+
+// Batch update all units of an item by name
+async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = false) {
+  try {
+    const res = await fetch('/api/items/batch-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: itemName, status: newStatus, sync_lightspeed: syncToLightspeed })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.detailed_items) {
+        detailedQueueItems = data.detailed_items;
+        updateStationBadge();
+        if (currentMainView === 'items') {
+          renderItemsStation();
+        }
+      }
+      fetchOrders();
+      fetchStats();
+      if (syncToLightspeed) {
+        showToast(`☁️ All "${itemName}" marked as ${newStatus} & synced with Lightspeed API`, 'success');
+      } else {
+        showToast(`🛡️ All "${itemName}" marked as ${newStatus} (Local only)`, 'info');
+      }
+    }
+  } catch (err) {
+    console.error("Failed to batch update items:", err);
+    showToast("Failed to batch update items", "error");
+  }
+}
+
 // Setup Event Listeners and Timers
 document.addEventListener('DOMContentLoaded', () => {
   fetchOrders();
+  fetchDetailedQueueItems();
   fetchStats();
   initSSE();
   updateSoundButtonUI();
@@ -778,7 +1167,11 @@ document.addEventListener('DOMContentLoaded', () => {
   if (searchInput) {
     searchInput.addEventListener('input', (e) => {
       searchQuery = e.target.value;
-      renderOrders();
+      if (currentMainView === 'items') {
+        renderItemsStation();
+      } else {
+        renderOrders();
+      }
     });
   }
 

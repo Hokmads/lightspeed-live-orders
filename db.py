@@ -40,11 +40,18 @@ def init_db():
         payment_status TEXT DEFAULT 'Paid',
         payment_method TEXT DEFAULT 'Credit Card',
         notes TEXT,
+        synced_to_lightspeed INTEGER DEFAULT 0,
         created_at TEXT,
         updated_at TEXT,
         raw_payload TEXT
     );
     """)
+
+    # Migration for existing databases
+    try:
+        cursor.execute("ALTER TABLE orders ADD COLUMN synced_to_lightspeed INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError:
+        pass
 
     # Order items table
     cursor.execute("""
@@ -57,9 +64,21 @@ def init_db():
         unit_price REAL DEFAULT 0.0,
         total_price REAL DEFAULT 0.0,
         modifiers TEXT,
+        status TEXT DEFAULT 'pending',
+        synced_to_lightspeed INTEGER DEFAULT 0,
         FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
     );
     """)
+
+    # Migration for order_items table
+    try:
+        cursor.execute("ALTER TABLE order_items ADD COLUMN status TEXT DEFAULT 'pending';")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE order_items ADD COLUMN synced_to_lightspeed INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError:
+        pass
 
     # Settings table
     cursor.execute("""
@@ -189,20 +208,29 @@ def save_order(order_data):
     # Save items
     items = order_data.get('items', [])
     if items:
+        cursor.execute("SELECT name, status, synced_to_lightspeed FROM order_items WHERE order_id = ?", (order_id,))
+        existing_item_map = {r['name']: (r['status'], r['synced_to_lightspeed']) for r in cursor.fetchall()}
+
         cursor.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
         for item in items:
+            name = item.get('name', 'Item')
+            prev_status, prev_synced = existing_item_map.get(name, ('pending', 0))
+            item_status = item.get('status') or prev_status or 'pending'
+            synced = item.get('synced_to_lightspeed', prev_synced) or 0
             cursor.execute("""
             INSERT INTO order_items (
-                order_id, name, sku, quantity, unit_price, total_price, modifiers
-            ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                order_id, name, sku, quantity, unit_price, total_price, modifiers, status, synced_to_lightspeed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 order_id,
-                item.get('name', 'Item'),
+                name,
                 item.get('sku', ''),
                 int(item.get('quantity', 1)),
                 float(item.get('unit_price', 0.0)),
                 float(item.get('total_price', 0.0)),
-                item.get('modifiers', '')
+                item.get('modifiers', ''),
+                item_status,
+                synced
             ))
 
     conn.commit()
@@ -211,14 +239,168 @@ def save_order(order_data):
     full_order = get_order_by_id(order_id)
     return full_order, is_new
 
-def update_order_status(order_id, new_status):
+def update_order_status(order_id, new_status, synced_to_lightspeed=None):
     now_iso = datetime.datetime.utcnow().isoformat() + "Z"
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?;", (new_status, now_iso, order_id))
+    if synced_to_lightspeed is not None:
+        cursor.execute("UPDATE orders SET status = ?, synced_to_lightspeed = ?, updated_at = ? WHERE id = ?;", 
+                       (new_status, 1 if synced_to_lightspeed else 0, now_iso, order_id))
+    else:
+        cursor.execute("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?;", (new_status, now_iso, order_id))
+
+    if new_status in ('ready', 'completed'):
+        if synced_to_lightspeed is not None:
+            cursor.execute("UPDATE order_items SET status = 'made', synced_to_lightspeed = ? WHERE order_id = ? AND status = 'pending';", 
+                           (1 if synced_to_lightspeed else 0, order_id))
+        else:
+            cursor.execute("UPDATE order_items SET status = 'made' WHERE order_id = ? AND status = 'pending';", 
+                           (order_id,))
+    elif new_status == 'new':
+        cursor.execute("UPDATE order_items SET status = 'pending' WHERE order_id = ?;", (order_id,))
+
     conn.commit()
     conn.close()
     return get_order_by_id(order_id)
+
+def update_item_status(item_id, new_status, synced_to_lightspeed=None):
+    """
+    Updates the status ('pending' or 'made') of an individual line item.
+    If all items in the order become 'made', automatically marks the parent order as 'ready'!
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    if synced_to_lightspeed is not None:
+        cursor.execute("UPDATE order_items SET status = ?, synced_to_lightspeed = ? WHERE id = ?;", 
+                       (new_status, 1 if synced_to_lightspeed else 0, item_id))
+    else:
+        cursor.execute("UPDATE order_items SET status = ? WHERE id = ?;", (new_status, item_id))
+
+    cursor.execute("SELECT order_id FROM order_items WHERE id = ?;", (item_id,))
+    row = cursor.fetchone()
+    order_id = row['order_id'] if row else None
+
+    # Check if all items in this order are now made
+    if order_id and new_status == 'made':
+        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status = 'pending';", (order_id,))
+        pending = cursor.fetchone()['pending_count']
+        if pending == 0:
+            now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+            cursor.execute("UPDATE orders SET status = 'ready', updated_at = ? WHERE id = ? AND status IN ('new', 'in_progress');", (now_iso, order_id))
+
+    conn.commit()
+    conn.close()
+    return get_order_by_id(order_id) if order_id else None
+
+def update_items_by_name(item_name, new_status, synced_to_lightspeed=None):
+    """
+    Batch updates all pending units of an item across active orders.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Find all matching active items
+    cursor.execute("""
+        SELECT oi.id, oi.order_id 
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        WHERE oi.name = ? AND o.status IN ('new', 'in_progress');
+    """, (item_name,))
+    matches = cursor.fetchall()
+
+    affected_order_ids = set()
+    for m in matches:
+        affected_order_ids.add(m['order_id'])
+        if synced_to_lightspeed is not None:
+            cursor.execute("UPDATE order_items SET status = ?, synced_to_lightspeed = ? WHERE id = ?;", 
+                           (new_status, 1 if synced_to_lightspeed else 0, m['id']))
+        else:
+            cursor.execute("UPDATE order_items SET status = ? WHERE id = ?;", (new_status, m['id']))
+
+    # Check auto-ready for affected orders
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    for o_id in affected_order_ids:
+        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status = 'pending';", (o_id,))
+        if cursor.fetchone()['pending_count'] == 0:
+            cursor.execute("UPDATE orders SET status = 'ready', updated_at = ? WHERE id = ? AND status IN ('new', 'in_progress');", (now_iso, o_id))
+
+    conn.commit()
+    conn.close()
+
+def get_detailed_queue_items():
+    """
+    Returns detailed grouped pending items for the Kitchen Items Queue Station Tab.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            oi.id as item_id,
+            oi.order_id,
+            oi.name,
+            oi.sku,
+            oi.quantity,
+            oi.modifiers,
+            oi.status as item_status,
+            oi.synced_to_lightspeed as item_synced,
+            o.order_number,
+            o.customer_name,
+            o.status as order_status,
+            o.created_at as order_created_at
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        WHERE o.status IN ('new', 'in_progress')
+        ORDER BY oi.name ASC, o.created_at ASC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    grouped = {}
+    for r in rows:
+        row_dict = dict(r)
+        name = row_dict['name']
+        if name not in grouped:
+            grouped[name] = {
+                'name': name,
+                'sku': row_dict['sku'] or '',
+                'total_quantity': 0,
+                'pending_quantity': 0,
+                'made_quantity': 0,
+                'order_lines': []
+            }
+        qty = row_dict['quantity']
+        grouped[name]['total_quantity'] += qty
+        if row_dict['item_status'] == 'made':
+            grouped[name]['made_quantity'] += qty
+        else:
+            grouped[name]['pending_quantity'] += qty
+        grouped[name]['order_lines'].append(row_dict)
+
+    # Sort so items with remaining pending quantity come first
+    sorted_items = sorted(
+        grouped.values(), 
+        key=lambda x: (x['pending_quantity'] == 0, -x['pending_quantity'], x['name'])
+    )
+    return sorted_items
+
+def get_active_queue_summary():
+    """
+    Returns aggregated items across all active orders ('new' and 'in_progress').
+    Example: [{'name': 'Flat White', 'total_quantity': 4, 'order_count': 3}, ...]
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT oi.name, oi.sku, SUM(oi.quantity) as total_quantity, COUNT(DISTINCT o.id) as order_count
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        WHERE o.status IN ('new', 'in_progress') AND oi.status = 'pending'
+        GROUP BY oi.name
+        ORDER BY total_quantity DESC, oi.name ASC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 def update_order_notes(order_id, notes):
     now_iso = datetime.datetime.utcnow().isoformat() + "Z"

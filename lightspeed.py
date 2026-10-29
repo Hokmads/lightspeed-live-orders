@@ -433,3 +433,57 @@ def generate_mock_order():
         "items": order_items,
         "raw_payload": {"simulated": True, "generated_at": now_iso}
     }
+
+def update_lightspeed_sale_status(settings, lightspeed_id, new_status):
+    """
+    Calls the Lightspeed API to update an order/sale status on Lightspeed's side.
+    If no API token is configured, or if it is a simulated order, operates in simulation mode.
+    Returns (success: bool, message: str, simulated: bool).
+    """
+    platform = settings.get('lightspeed_platform', 'r_series')
+    api_token = settings.get('api_token', '').strip()
+    account_id = settings.get('account_id', '').strip()
+    domain_prefix = settings.get('domain_prefix', '').strip()
+
+    clean_id = str(lightspeed_id).replace('R-', '').replace('X-', '').replace('SIM-', '').replace('GEN-', '')
+
+    if not api_token or 'SIM' in str(lightspeed_id):
+        return True, f"Simulated Lightspeed API call: marked #{clean_id} as '{new_status}'", True
+
+    headers = {
+        'Authorization': f"Bearer {api_token}",
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'LightspeedLiveOrdersDashboard/1.0'
+    }
+
+    ctx = ssl.create_default_context()
+
+    try:
+        if platform == 'r_series' and account_id:
+            url = f"https://api.lightspeedapp.com/API/Account/{account_id}/Sale/{clean_id}.json"
+            payload = json.dumps({
+                "completed": True if new_status in ('ready', 'completed') else False,
+                "note": f"Order status updated to {new_status.upper()}"
+            }).encode('utf-8')
+            req = urllib.request.Request(url, data=payload, headers=headers, method='PUT')
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+                return True, f"Successfully marked #{clean_id} as '{new_status}' via Lightspeed R-Series API", False
+
+        elif platform == 'x_series' and domain_prefix:
+            url = f"https://{domain_prefix}.vendhq.com/api/2.0/sales/{clean_id}"
+            payload = json.dumps({
+                "status": "CLOSED" if new_status == 'completed' else "SAVED",
+                "note": f"Order marked as {new_status.upper()}"
+            }).encode('utf-8')
+            req = urllib.request.Request(url, data=payload, headers=headers, method='PUT')
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+                return True, f"Successfully marked #{clean_id} as '{new_status}' via Lightspeed X-Series API", False
+
+        return True, f"Marked #{clean_id} as '{new_status}'", True
+
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode('utf-8', errors='ignore')[:150]
+        return False, f"Lightspeed API Error ({e.code}): {err_msg or e.reason}", False
+    except Exception as e:
+        return False, f"Failed to sync with Lightspeed API: {str(e)}", False

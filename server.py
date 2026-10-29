@@ -16,11 +16,12 @@ import queue
 from db import (
     init_db, get_settings, update_settings, save_order,
     update_order_status, update_order_notes, get_order_by_id, list_orders,
-    get_stats, clear_all_orders
+    get_stats, clear_all_orders, get_active_queue_summary,
+    get_detailed_queue_items, update_item_status, update_items_by_name
 )
 from lightspeed import (
     normalize_webhook_payload, test_api_connection,
-    poll_lightspeed_sales, generate_mock_order
+    poll_lightspeed_sales, generate_mock_order, update_lightspeed_sale_status
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
@@ -163,6 +164,16 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(200, get_stats())
             return
 
+        # 4b. REST API: Active Items Queue Summary
+        if path == '/api/queue-summary':
+            self.send_json_response(200, {'items': get_active_queue_summary()})
+            return
+
+        # 4c. REST API: Detailed Queue Items (Items Station Tab)
+        if path == '/api/detailed-queue-items':
+            self.send_json_response(200, {'items': get_detailed_queue_items()})
+            return
+
         # 5. REST API: Settings
         if path == '/api/settings':
             settings = get_settings()
@@ -196,7 +207,9 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             init_msg = json.dumps({
                 "type": "connected",
                 "message": "Connected to Lightspeed Live Stream",
-                "stats": get_stats()
+                "stats": get_stats(),
+                "queue_summary": get_active_queue_summary(),
+                "detailed_queue": get_detailed_queue_items()
             })
             self.wfile.write(f"data: {init_msg}\n\n".encode('utf-8'))
             self.wfile.flush()
@@ -238,6 +251,7 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 sse_manager.broadcast("order_updated", saved_order)
             sse_manager.broadcast("stats_updated", get_stats())
+            sse_manager.broadcast("queue_updated", get_active_queue_summary())
 
             self.send_json_response(200, {
                 'status': 'success',
@@ -246,16 +260,28 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 2. Update Order Status
+        # 2. Update Order Status (supports sync_lightspeed flag)
         if path.startswith('/api/orders/') and path.endswith('/status'):
             parts = path.split('/')
             order_id = parts[3]
             new_status = data.get('status', 'new')
-            updated = update_order_status(order_id, new_status)
+            sync_lightspeed = bool(data.get('sync_lightspeed', False))
+
+            api_result = None
+            if sync_lightspeed:
+                order = get_order_by_id(order_id)
+                if order:
+                    settings = get_settings()
+                    success, msg, is_sim = update_lightspeed_sale_status(settings, order.get('lightspeed_id') or order_id, new_status)
+                    api_result = {'success': success, 'message': msg, 'simulated': is_sim}
+
+            updated = update_order_status(order_id, new_status, synced_to_lightspeed=sync_lightspeed)
             if updated:
                 sse_manager.broadcast("order_updated", updated)
                 sse_manager.broadcast("stats_updated", get_stats())
-                self.send_json_response(200, {'order': updated})
+                sse_manager.broadcast("queue_updated", get_active_queue_summary())
+                sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
+                self.send_json_response(200, {'order': updated, 'api_result': api_result})
             else:
                 self.send_json_response(404, {'error': 'Order not found'})
             return
@@ -273,12 +299,66 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json_response(404, {'error': 'Order not found'})
             return
 
+        # 2c. Update Individual Order Item Status (Local or API)
+        if path.startswith('/api/items/') and path.endswith('/status'):
+            parts = path.split('/')
+            item_id = int(parts[3])
+            new_status = data.get('status', 'made')
+            sync_lightspeed = bool(data.get('sync_lightspeed', False))
+
+            api_result = None
+            if sync_lightspeed:
+                settings = get_settings()
+                success, msg, is_sim = update_lightspeed_sale_status(settings, f"item-{item_id}", new_status)
+                api_result = {'success': success, 'message': msg, 'simulated': is_sim}
+
+            updated_order = update_item_status(item_id, new_status, synced_to_lightspeed=sync_lightspeed)
+            sse_manager.broadcast("queue_updated", get_active_queue_summary())
+            sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
+            if updated_order:
+                sse_manager.broadcast("order_updated", updated_order)
+                sse_manager.broadcast("stats_updated", get_stats())
+
+            self.send_json_response(200, {
+                'status': 'success',
+                'order': updated_order,
+                'api_result': api_result,
+                'detailed_items': get_detailed_queue_items()
+            })
+            return
+
+        # 2d. Batch Update Items by Name (e.g. Mark all Flat Whites made)
+        if path == '/api/items/batch-status':
+            item_name = data.get('name')
+            new_status = data.get('status', 'made')
+            sync_lightspeed = bool(data.get('sync_lightspeed', False))
+
+            api_result = None
+            if sync_lightspeed:
+                settings = get_settings()
+                success, msg, is_sim = update_lightspeed_sale_status(settings, item_name, new_status)
+                api_result = {'success': success, 'message': msg, 'simulated': is_sim}
+
+            update_items_by_name(item_name, new_status, synced_to_lightspeed=sync_lightspeed)
+            sse_manager.broadcast("queue_updated", get_active_queue_summary())
+            sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
+            sse_manager.broadcast("stats_updated", get_stats())
+
+            self.send_json_response(200, {
+                'status': 'success',
+                'api_result': api_result,
+                'detailed_items': get_detailed_queue_items()
+            })
+            return
+
         # 3. Simulate Incoming Order (One-click demo/test)
         if path == '/api/simulate-order':
             mock = generate_mock_order()
             saved_order, is_new = save_order(mock)
             sse_manager.broadcast("new_order", saved_order)
             sse_manager.broadcast("stats_updated", get_stats())
+            sse_manager.broadcast("queue_updated", get_active_queue_summary())
+            sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
             self.send_json_response(201, {'order': saved_order})
             return
 
@@ -320,6 +400,8 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
                     sse_manager.broadcast("order_updated", saved)
             if count > 0:
                 sse_manager.broadcast("stats_updated", get_stats())
+                sse_manager.broadcast("queue_updated", get_active_queue_summary())
+                sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
             self.send_json_response(200, {'synced_count': len(sales), 'new_count': count})
             return
 
@@ -328,6 +410,8 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             clear_all_orders()
             sse_manager.broadcast("orders_cleared", {})
             sse_manager.broadcast("stats_updated", get_stats())
+            sse_manager.broadcast("queue_updated", [])
+            sse_manager.broadcast("detailed_queue_updated", [])
             self.send_json_response(200, {'status': 'cleared'})
             return
 

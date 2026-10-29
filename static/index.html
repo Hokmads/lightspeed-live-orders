@@ -44,8 +44,8 @@
         ⚙️ Settings &amp; API
       </button>
 
-      <!-- Clear Orders Trigger -->
-      <button class="btn btn-danger btn-icon" onclick="clearAllOrders()" title="Clear orders">
+      <!-- Clear Orders Trigger (Local Only) -->
+      <button class="btn btn-danger btn-icon" onclick="clearAllOrders()" title="Clear orders from screen (Local only — does NOT affect Lightspeed POS)">
         🗑️
       </button>
     </div>
@@ -84,24 +84,37 @@
     </div>
   </section>
 
-  <!-- Filter Tabs and Search Bar -->
+  <!-- Filter Tabs and Search Bar with Main View Mode Switcher -->
   <section class="controls-bar">
-    <div class="filter-tabs">
-      <button class="tab-btn active" data-status="all">
-        All <span class="tab-badge" id="tab-count-all">0</span>
-      </button>
-      <button class="tab-btn" data-status="new">
-        New <span class="tab-badge" id="tab-count-new">0</span>
-      </button>
-      <button class="tab-btn" data-status="in_progress">
-        In Progress <span class="tab-badge" id="tab-count-in_progress">0</span>
-      </button>
-      <button class="tab-btn" data-status="ready">
-        Ready <span class="tab-badge" id="tab-count-ready">0</span>
-      </button>
-      <button class="tab-btn" data-status="completed">
-        Completed <span class="tab-badge" id="tab-count-completed">0</span>
-      </button>
+    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+      <!-- Main Mode Switcher: Orders vs Items Queue -->
+      <div class="main-view-tabs">
+        <button id="btn-view-orders" class="main-tab-btn active" onclick="switchMainView('orders')">
+          📦 Orders Feed
+        </button>
+        <button id="btn-view-items" class="main-tab-btn" onclick="switchMainView('items')">
+          🍳 Items Queue <span class="tab-badge" id="station-queue-badge">0</span>
+        </button>
+      </div>
+
+      <!-- Status Filter Tabs (for Orders Feed) -->
+      <div class="filter-tabs" id="orders-status-filters">
+        <button class="tab-btn active" data-status="all">
+          All <span class="tab-badge" id="tab-count-all">0</span>
+        </button>
+        <button class="tab-btn" data-status="new">
+          New <span class="tab-badge" id="tab-count-new">0</span>
+        </button>
+        <button class="tab-btn" data-status="in_progress">
+          Prep <span class="tab-badge" id="tab-count-in_progress">0</span>
+        </button>
+        <button class="tab-btn" data-status="ready">
+          Ready <span class="tab-badge" id="tab-count-ready">0</span>
+        </button>
+        <button class="tab-btn" data-status="completed">
+          Done <span class="tab-badge" id="tab-count-completed">0</span>
+        </button>
+      </div>
     </div>
 
     <div class="search-and-view">
@@ -109,15 +122,39 @@
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
         </svg>
-        <input type="text" id="search-input" placeholder="Search order #, customer, item...">
+        <input type="text" id="search-input" placeholder="Search orders or items...">
       </div>
     </div>
   </section>
 
-  <!-- Orders Display Grid -->
+  <!-- Kitchen Item Queue / All-Day Summary Bar -->
+  <section class="queue-summary-section" id="all-day-bar-section">
+    <div class="queue-summary-header">
+      <div class="queue-header-left">
+        <span class="queue-title-icon">🍳</span>
+        <span class="queue-title-text">Active Order Queue Items</span>
+        <span class="queue-badge" id="queue-total-items-badge">0 to make</span>
+      </div>
+      <div class="queue-header-right">
+        <span class="queue-hint">Tap item to filter cards</span>
+        <button id="clear-item-filter-btn" class="btn-clear-filter" onclick="clearItemFilter()" style="display: none;">✕ Show All</button>
+      </div>
+    </div>
+    <div id="queue-items-container" class="queue-items-scroll">
+      <!-- Dynamic item count pills rendered by app.js -->
+    </div>
+  </section>
+
+  <!-- Main Content Area: Supports Orders Feed AND Items Queue Station -->
   <main class="content-area">
+    <!-- View 1: Orders Feed -->
     <div id="orders-container" class="orders-grid">
       <!-- Dynamically populated by app.js -->
+    </div>
+
+    <!-- View 2: Dedicated Items Queue Station Grid -->
+    <div id="items-station-container" class="items-station-grid" style="display: none;">
+      <!-- Dynamically populated with station item cards by app.js -->
     </div>
   </main>
 
