@@ -1,0 +1,2 @@
+# Zero external pip packages required.
+# Uses Python 3 standard library: http.server, socketserver, sqlite3, urllib.request, ssl, json, threading, queue.

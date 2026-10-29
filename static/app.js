@@ -478,14 +478,20 @@ function renderOrderModal(order) {
       </div>
     </div>
 
-    ${order.notes ? `
+    <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd; padding: 8px 12px; border-radius: var(--radius-md); font-size: 12px; display: flex; align-items: center; gap: 8px;">
+      <span>🛡️</span>
       <div>
-        <h4 style="font-size: 13px; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 6px;">Customer Notes</h4>
-        <div style="background: var(--bg-primary); padding: 10px 14px; border-radius: var(--radius-md); font-size: 13px; color: var(--accent-amber);">
-          ${escapeHtml(order.notes)}
-        </div>
+        <strong>Local-Only Display Status:</strong> Marking this order as Prep, Ready, or Complete stays 100% on this dashboard. It does <u>not</u> alter, void, or change sales records in Lightspeed.
       </div>
-    ` : ''}
+    </div>
+
+    <div>
+      <h4 style="font-size: 13px; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 8px;">Internal Staff / Kitchen Notes (Local)</h4>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <input type="text" id="modal-internal-notes" value="${escapeHtml(order.notes || '')}" placeholder="Add local notes (e.g. Table 4, boxed to-go, extra napkins)..." style="flex: 1; background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-primary); padding: 8px 12px; border-radius: var(--radius-md); font-size: 13px; outline: none;">
+        <button class="btn btn-secondary" onclick="saveOrderNotes('${order.id}')" style="white-space: nowrap;">💾 Save Note</button>
+      </div>
+    </div>
   `;
 
   // Modal Footer Actions
@@ -493,10 +499,35 @@ function renderOrderModal(order) {
   footer.innerHTML = `
     <button class="btn btn-secondary" onclick="window.print()">🖨️ Print Ticket</button>
     <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'new'); closeOrderModal();">New</button>
-    <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'in_progress'); closeOrderModal();">Prep</button>
-    <button class="btn btn-success" onclick="updateOrderStatus('${order.id}', 'ready'); closeOrderModal();">Ready</button>
-    <button class="btn btn-primary" onclick="updateOrderStatus('${order.id}', 'completed'); closeOrderModal();">Complete</button>
+    <button class="btn btn-secondary" onclick="updateOrderStatus('${order.id}', 'in_progress'); closeOrderModal();">⏳ Prep</button>
+    <button class="btn btn-success" onclick="updateOrderStatus('${order.id}', 'ready'); closeOrderModal();">✓ Ready</button>
+    <button class="btn btn-primary" onclick="updateOrderStatus('${order.id}', 'completed'); closeOrderModal();">🏁 Complete</button>
   `;
+}
+
+// Save Internal Staff Notes locally
+async function saveOrderNotes(orderId) {
+  const notesInput = document.getElementById('modal-internal-notes');
+  if (!notesInput) return;
+  const notes = notesInput.value.trim();
+  try {
+    const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/notes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes })
+    });
+    if (res.ok) {
+      showToast('Internal note saved locally', 'success');
+      const data = await res.json();
+      const idx = orders.findIndex(o => o.id === orderId);
+      if (idx !== -1) {
+        orders[idx] = data.order;
+        renderOrders();
+      }
+    }
+  } catch (err) {
+    showToast('Failed to save note', 'error');
+  }
 }
 
 // Simulate Order

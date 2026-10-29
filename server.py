@@ -15,7 +15,7 @@ import queue
 
 from db import (
     init_db, get_settings, update_settings, save_order,
-    update_order_status, get_order_by_id, list_orders,
+    update_order_status, update_order_notes, get_order_by_id, list_orders,
     get_stats, clear_all_orders
 )
 from lightspeed import (
@@ -24,7 +24,7 @@ from lightspeed import (
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
-PORT = 8080
+PORT = int(os.environ.get('PORT', 8080))
 
 class SSEManager:
     """Manages connected SSE client queues and handles broadcasting."""
@@ -255,6 +255,19 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             if updated:
                 sse_manager.broadcast("order_updated", updated)
                 sse_manager.broadcast("stats_updated", get_stats())
+                self.send_json_response(200, {'order': updated})
+            else:
+                self.send_json_response(404, {'error': 'Order not found'})
+            return
+
+        # 2b. Update Order Local Notes
+        if path.startswith('/api/orders/') and path.endswith('/notes'):
+            parts = path.split('/')
+            order_id = parts[3]
+            notes = data.get('notes', '')
+            updated = update_order_notes(order_id, notes)
+            if updated:
+                sse_manager.broadcast("order_updated", updated)
                 self.send_json_response(200, {'order': updated})
             else:
                 self.send_json_response(404, {'error': 'Order not found'})

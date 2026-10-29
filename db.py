@@ -220,6 +220,15 @@ def update_order_status(order_id, new_status):
     conn.close()
     return get_order_by_id(order_id)
 
+def update_order_notes(order_id, notes):
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET notes = ?, updated_at = ? WHERE id = ?;", (notes, now_iso, order_id))
+    conn.commit()
+    conn.close()
+    return get_order_by_id(order_id)
+
 def get_order_by_id(order_id):
     conn = get_connection()
     cursor = conn.cursor()

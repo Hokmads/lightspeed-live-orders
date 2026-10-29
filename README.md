@@ -124,6 +124,70 @@ You do not need an active store ringing sales to verify the dashboard:
    ```
    Notice that the dashboard updates instantaneously without reloading!
 
+## 🛡️ Independent Local Status Tracking (Safe from Lightspeed POS)
+
+A key design feature of this dashboard is **strict separation between kitchen display status and POS accounting**:
+- **Read-Only Integration**: The dashboard only *reads* sales and orders from Lightspeed.
+- **Local State Isolation**: When you click **Start Prep**, **Mark Ready**, **Complete**, or add **Internal Staff Notes**, these actions are stored exclusively in your local database (`orders.db`).
+- **Never Alters Lightspeed Sales**: Status changes on this board **will never** void, modify, alter, refund, or mark sales completed in Lightspeed's backoffice or register.
+- **Sync Protection**: Subsequent background polls or incoming webhooks from Lightspeed will preserve your local progression status and will not reset your orders.
+
+---
+
+## 🌐 How to Host on GitHub & Deploy Live
+
+Because this application uses **real-time Server-Sent Events (SSE)**, an **automated background poller**, and a **webhook receiver**, it requires a lightweight Python backend running.
+
+Here are the step-by-step instructions:
+
+### Step 1: Push your Code to GitHub
+
+1. Go to [GitHub.com](https://github.com) and click **New Repository** (e.g. `lightspeed-live-orders`).
+2. Keep it public or private, and do not initialize with a README (we already have one).
+3. In your local terminal, run:
+
+```bash
+cd /Users/tony/.gemini/antigravity/scratch/lightspeed-live-orders
+
+# Link your local repo to GitHub (replace with your GitHub username)
+git remote add origin https://github.com/<your-username>/lightspeed-live-orders.git
+
+# Set main branch and push
+git branch -M main
+git push -u origin main
+```
+
+---
+
+### Step 2: Host Online with Free 24/7 Cloud Deployment (Render / Railway)
+
+By connecting your GitHub repository to a free cloud platform like **Render** or **Railway**, your dashboard will automatically build, deploy, and stay live with a free public HTTPS URL:
+
+#### Option A: Deploy on Render (Recommended & Free)
+1. Sign up / log in to [Render.com](https://render.com) using your GitHub account.
+2. Click **New +** ➜ **Web Service**.
+3. Select your `lightspeed-live-orders` repository.
+4. Render will auto-detect the included `render.yaml` and `Procfile`:
+   - **Environment**: `Python 3`
+   - **Build Command**: *(leave empty)*
+   - **Start Command**: `python3 server.py`
+5. Click **Create Web Service**.
+6. Within 1 minute, you will receive a public HTTPS URL:
+   `https://lightspeed-live-orders-xxxx.onrender.com`
+7. Now you can:
+   - Open this URL on any device, tablet, or phone in your kitchen/store.
+   - Use `https://lightspeed-live-orders-xxxx.onrender.com/api/webhooks/lightspeed` directly in Lightspeed's webhook settings without needing ngrok!
+
+#### Option B: Run in GitHub Codespaces (Browser-based)
+If you just want to run it from GitHub without any third-party services:
+1. On your GitHub repository page, click the green **Code** button.
+2. Select the **Codespaces** tab and click **Create codespace on main**.
+3. In the built-in terminal, type:
+   ```bash
+   python3 server.py
+   ```
+4. A notification popup will say *"Your application running on port 8080 is available"*. Click **Open in Browser**!
+
 ---
 
 ## 📂 Project Architecture
@@ -133,6 +197,9 @@ lightspeed-live-orders/
 ├── server.py        # Multi-threaded HTTP & Server-Sent Events (SSE) server
 ├── db.py            # SQLite database with Write-Ahead Logging (WAL)
 ├── lightspeed.py    # Lightspeed R-Series & X-Series API integration & normalizer
+├── Procfile         # Cloud deployment specification
+├── requirements.txt # Python package specification for cloud platforms
+├── render.yaml      # 1-click cloud blueprint for Render
 ├── start.sh         # Convenience launcher script
 ├── README.md        # Documentation and setup guide
 └── static/
