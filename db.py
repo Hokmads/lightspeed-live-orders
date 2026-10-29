@@ -61,6 +61,7 @@ def init_db():
         name TEXT NOT NULL,
         sku TEXT,
         quantity INTEGER DEFAULT 1,
+        quantity_made INTEGER DEFAULT 0,
         unit_price REAL DEFAULT 0.0,
         total_price REAL DEFAULT 0.0,
         modifiers TEXT,
@@ -72,6 +73,10 @@ def init_db():
 
     # Migration for order_items table
     try:
+        cursor.execute("ALTER TABLE order_items ADD COLUMN quantity_made INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError:
+        pass
+    try:
         cursor.execute("ALTER TABLE order_items ADD COLUMN status TEXT DEFAULT 'pending';")
     except sqlite3.OperationalError:
         pass
@@ -79,6 +84,9 @@ def init_db():
         cursor.execute("ALTER TABLE order_items ADD COLUMN synced_to_lightspeed INTEGER DEFAULT 0;")
     except sqlite3.OperationalError:
         pass
+
+    cursor.execute("UPDATE order_items SET quantity_made = quantity WHERE status = 'made' AND (quantity_made IS NULL OR quantity_made = 0);")
+    cursor.execute("UPDATE order_items SET quantity_made = 0 WHERE status = 'pending' AND quantity_made IS NULL;")
 
     # Settings table
     cursor.execute("""
@@ -208,24 +216,26 @@ def save_order(order_data):
     # Save items
     items = order_data.get('items', [])
     if items:
-        cursor.execute("SELECT name, status, synced_to_lightspeed FROM order_items WHERE order_id = ?", (order_id,))
-        existing_item_map = {r['name']: (r['status'], r['synced_to_lightspeed']) for r in cursor.fetchall()}
+        cursor.execute("SELECT name, status, synced_to_lightspeed, quantity_made FROM order_items WHERE order_id = ?", (order_id,))
+        existing_item_map = {r['name']: (r['status'], r['synced_to_lightspeed'], r['quantity_made']) for r in cursor.fetchall()}
 
         cursor.execute("DELETE FROM order_items WHERE order_id = ?", (order_id,))
         for item in items:
             name = item.get('name', 'Item')
-            prev_status, prev_synced = existing_item_map.get(name, ('pending', 0))
+            prev_status, prev_synced, prev_made = existing_item_map.get(name, ('pending', 0, 0))
             item_status = item.get('status') or prev_status or 'pending'
             synced = item.get('synced_to_lightspeed', prev_synced) or 0
+            qty_made = item.get('quantity_made', prev_made) or 0
             cursor.execute("""
             INSERT INTO order_items (
-                order_id, name, sku, quantity, unit_price, total_price, modifiers, status, synced_to_lightspeed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                order_id, name, sku, quantity, quantity_made, unit_price, total_price, modifiers, status, synced_to_lightspeed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 order_id,
                 name,
                 item.get('sku', ''),
                 int(item.get('quantity', 1)),
+                int(qty_made),
                 float(item.get('unit_price', 0.0)),
                 float(item.get('total_price', 0.0)),
                 item.get('modifiers', ''),
@@ -251,78 +261,155 @@ def update_order_status(order_id, new_status, synced_to_lightspeed=None):
 
     if new_status in ('ready', 'completed'):
         if synced_to_lightspeed is not None:
-            cursor.execute("UPDATE order_items SET status = 'made', synced_to_lightspeed = ? WHERE order_id = ? AND status = 'pending';", 
+            cursor.execute("UPDATE order_items SET status = 'made', quantity_made = quantity, synced_to_lightspeed = ? WHERE order_id = ? AND status != 'made';", 
                            (1 if synced_to_lightspeed else 0, order_id))
         else:
-            cursor.execute("UPDATE order_items SET status = 'made' WHERE order_id = ? AND status = 'pending';", 
+            cursor.execute("UPDATE order_items SET status = 'made', quantity_made = quantity WHERE order_id = ? AND status != 'made';", 
                            (order_id,))
     elif new_status == 'new':
-        cursor.execute("UPDATE order_items SET status = 'pending' WHERE order_id = ?;", (order_id,))
+        cursor.execute("UPDATE order_items SET status = 'pending', quantity_made = 0 WHERE order_id = ?;", (order_id,))
 
     conn.commit()
     conn.close()
     return get_order_by_id(order_id)
 
-def update_item_status(item_id, new_status, synced_to_lightspeed=None):
+def update_item_status(item_id, new_status=None, synced_to_lightspeed=None, quantity_delta=None, count=None):
     """
-    Updates the status ('pending' or 'made') of an individual line item.
-    If all items in the order become 'made', automatically marks the parent order as 'ready'!
+    Updates the status or made count of an individual line item.
+    - If count is passed: sets quantity_made = count
+    - If quantity_delta is passed (e.g. +1 or -1): adjusts quantity_made by that delta
+    - If new_status == 'made': marks fully made (quantity_made = quantity)
+    - If new_status == 'pending': marks pending (quantity_made = 0)
+    If all items in the order become made, automatically marks the parent order as 'ready'!
     """
     conn = get_connection()
     cursor = conn.cursor()
-    if synced_to_lightspeed is not None:
-        cursor.execute("UPDATE order_items SET status = ?, synced_to_lightspeed = ? WHERE id = ?;", 
-                       (new_status, 1 if synced_to_lightspeed else 0, item_id))
-    else:
-        cursor.execute("UPDATE order_items SET status = ? WHERE id = ?;", (new_status, item_id))
-
-    cursor.execute("SELECT order_id FROM order_items WHERE id = ?;", (item_id,))
+    cursor.execute("SELECT id, order_id, quantity, COALESCE(quantity_made, 0) as quantity_made, status, synced_to_lightspeed FROM order_items WHERE id = ?;", (item_id,))
     row = cursor.fetchone()
-    order_id = row['order_id'] if row else None
+    if not row:
+        conn.close()
+        return None
 
-    # Check if all items in this order are now made
-    if order_id and new_status == 'made':
-        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status = 'pending';", (order_id,))
+    order_id = row['order_id']
+    qty = row['quantity']
+    current_made = row['quantity_made']
+
+    if count is not None:
+        new_made = max(0, min(qty, int(count)))
+    elif quantity_delta is not None:
+        new_made = max(0, min(qty, current_made + int(quantity_delta)))
+    elif new_status == 'made':
+        new_made = qty
+    elif new_status == 'pending':
+        new_made = 0
+    else:
+        new_made = current_made
+
+    if new_made >= qty:
+        computed_status = 'made'
+    elif new_made > 0:
+        computed_status = 'partially_made'
+    else:
+        computed_status = 'pending'
+
+    final_status = new_status if (new_status in ('made', 'pending') and count is None and quantity_delta is None) else computed_status
+
+    if synced_to_lightspeed is not None:
+        cursor.execute("UPDATE order_items SET status = ?, quantity_made = ?, synced_to_lightspeed = ? WHERE id = ?;", 
+                       (final_status, new_made, 1 if synced_to_lightspeed else 0, item_id))
+    else:
+        cursor.execute("UPDATE order_items SET status = ?, quantity_made = ? WHERE id = ?;", 
+                       (final_status, new_made, item_id))
+
+    # Check order auto-transitions
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    if order_id:
+        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status != 'made';", (order_id,))
         pending = cursor.fetchone()['pending_count']
         if pending == 0:
-            now_iso = datetime.datetime.utcnow().isoformat() + "Z"
             cursor.execute("UPDATE orders SET status = 'ready', updated_at = ? WHERE id = ? AND status IN ('new', 'in_progress');", (now_iso, order_id))
+        else:
+            cursor.execute("UPDATE orders SET status = 'in_progress', updated_at = ? WHERE id = ? AND status = 'ready';", (now_iso, order_id))
 
     conn.commit()
     conn.close()
     return get_order_by_id(order_id) if order_id else None
 
-def update_items_by_name(item_name, new_status, synced_to_lightspeed=None):
+def update_items_by_name(item_name, count_to_mark=None, new_status='made', synced_to_lightspeed=None):
     """
-    Batch updates all pending units of an item across active orders.
+    Batch updates units of an item across active orders.
+    - If count_to_mark is None: marks ALL pending units of item_name as made (or pending if new_status=='pending')
+    - If count_to_mark is an integer (e.g. 1, 2, 3...): marks that exact number of units as made (FIFO across active orders),
+      or unmarks that many units if new_status=='pending' (LIFO).
     """
     conn = get_connection()
     cursor = conn.cursor()
-    
-    # Find all matching active items
-    cursor.execute("""
-        SELECT oi.id, oi.order_id 
-        FROM order_items oi
-        JOIN orders o ON oi.order_id = o.id
-        WHERE oi.name = ? AND o.status IN ('new', 'in_progress');
-    """, (item_name,))
-    matches = cursor.fetchall()
-
     affected_order_ids = set()
-    for m in matches:
-        affected_order_ids.add(m['order_id'])
-        if synced_to_lightspeed is not None:
-            cursor.execute("UPDATE order_items SET status = ?, synced_to_lightspeed = ? WHERE id = ?;", 
-                           (new_status, 1 if synced_to_lightspeed else 0, m['id']))
-        else:
-            cursor.execute("UPDATE order_items SET status = ? WHERE id = ?;", (new_status, m['id']))
 
-    # Check auto-ready for affected orders
+    if new_status == 'pending':
+        # Reopen / undo (LIFO: newest made first)
+        cursor.execute("""
+            SELECT oi.id, oi.order_id, oi.quantity, COALESCE(oi.quantity_made, 0) as quantity_made
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.id
+            WHERE oi.name = ? AND o.status IN ('new', 'in_progress', 'ready') AND COALESCE(oi.quantity_made, 0) > 0
+            ORDER BY o.created_at DESC, oi.id DESC;
+        """, (item_name,))
+        rows = cursor.fetchall()
+        remaining = int(count_to_mark) if count_to_mark is not None else 999999
+
+        for r in rows:
+            if remaining <= 0:
+                break
+            q_made = r['quantity_made']
+            reduce_by = min(q_made, remaining)
+            new_made = q_made - reduce_by
+            st = 'pending' if new_made == 0 else 'partially_made'
+            if synced_to_lightspeed is not None:
+                cursor.execute("UPDATE order_items SET status = ?, quantity_made = ?, synced_to_lightspeed = ? WHERE id = ?;", 
+                               (st, new_made, 1 if synced_to_lightspeed else 0, r['id']))
+            else:
+                cursor.execute("UPDATE order_items SET status = ?, quantity_made = ? WHERE id = ?;", 
+                               (st, new_made, r['id']))
+            affected_order_ids.add(r['order_id'])
+            remaining -= reduce_by
+
+    else:
+        # Mark made (FIFO: oldest orders first)
+        cursor.execute("""
+            SELECT oi.id, oi.order_id, oi.quantity, COALESCE(oi.quantity_made, 0) as quantity_made
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.id
+            WHERE oi.name = ? AND o.status IN ('new', 'in_progress') AND (oi.quantity - COALESCE(oi.quantity_made, 0)) > 0
+            ORDER BY o.created_at ASC, oi.id ASC;
+        """, (item_name,))
+        rows = cursor.fetchall()
+        remaining = int(count_to_mark) if count_to_mark is not None else 999999
+
+        for r in rows:
+            if remaining <= 0:
+                break
+            needed = r['quantity'] - r['quantity_made']
+            add_by = min(needed, remaining)
+            new_made = r['quantity_made'] + add_by
+            st = 'made' if new_made >= r['quantity'] else 'partially_made'
+            if synced_to_lightspeed is not None:
+                cursor.execute("UPDATE order_items SET status = ?, quantity_made = ?, synced_to_lightspeed = ? WHERE id = ?;", 
+                               (st, new_made, 1 if synced_to_lightspeed else 0, r['id']))
+            else:
+                cursor.execute("UPDATE order_items SET status = ?, quantity_made = ? WHERE id = ?;", 
+                               (st, new_made, r['id']))
+            affected_order_ids.add(r['order_id'])
+            remaining -= add_by
+
+    # Check auto-ready / in_progress transitions for affected orders
     now_iso = datetime.datetime.utcnow().isoformat() + "Z"
     for o_id in affected_order_ids:
-        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status = 'pending';", (o_id,))
+        cursor.execute("SELECT COUNT(*) as pending_count FROM order_items WHERE order_id = ? AND status != 'made';", (o_id,))
         if cursor.fetchone()['pending_count'] == 0:
             cursor.execute("UPDATE orders SET status = 'ready', updated_at = ? WHERE id = ? AND status IN ('new', 'in_progress');", (now_iso, o_id))
+        else:
+            cursor.execute("UPDATE orders SET status = 'in_progress', updated_at = ? WHERE id = ? AND status = 'ready';", (now_iso, o_id))
 
     conn.commit()
     conn.close()
@@ -340,6 +427,7 @@ def get_detailed_queue_items():
             oi.name,
             oi.sku,
             oi.quantity,
+            COALESCE(oi.quantity_made, 0) as quantity_made,
             oi.modifiers,
             oi.status as item_status,
             oi.synced_to_lightspeed as item_synced,
@@ -368,12 +456,16 @@ def get_detailed_queue_items():
                 'made_quantity': 0,
                 'order_lines': []
             }
-        qty = row_dict['quantity']
+        qty = int(row_dict['quantity'])
+        qty_made = min(qty, int(row_dict['quantity_made']))
+        qty_pending = max(0, qty - qty_made)
+
         grouped[name]['total_quantity'] += qty
-        if row_dict['item_status'] == 'made':
-            grouped[name]['made_quantity'] += qty
-        else:
-            grouped[name]['pending_quantity'] += qty
+        grouped[name]['made_quantity'] += qty_made
+        grouped[name]['pending_quantity'] += qty_pending
+
+        row_dict['line_made_quantity'] = qty_made
+        row_dict['line_pending_quantity'] = qty_pending
         grouped[name]['order_lines'].append(row_dict)
 
     # Sort so items with remaining pending quantity come first
@@ -391,10 +483,10 @@ def get_active_queue_summary():
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT oi.name, oi.sku, SUM(oi.quantity) as total_quantity, COUNT(DISTINCT o.id) as order_count
+        SELECT oi.name, oi.sku, SUM(oi.quantity - COALESCE(oi.quantity_made, 0)) as total_quantity, COUNT(DISTINCT o.id) as order_count
         FROM order_items oi
         JOIN orders o ON oi.order_id = o.id
-        WHERE o.status IN ('new', 'in_progress') AND oi.status = 'pending'
+        WHERE o.status IN ('new', 'in_progress') AND (oi.quantity - COALESCE(oi.quantity_made, 0)) > 0
         GROUP BY oi.name
         ORDER BY total_quantity DESC, oi.name ASC;
     """)

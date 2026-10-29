@@ -956,6 +956,84 @@ function updateStationBadge() {
   badge.textContent = pendingTotal;
 }
 
+// Custom quantities selected for each station card
+const stationCardQuantities = {};
+
+function getItemMarkQty(name, maxQty) {
+  if (stationCardQuantities[name] === undefined) {
+    stationCardQuantities[name] = Math.min(1, maxQty);
+  }
+  return Math.min(Math.max(1, stationCardQuantities[name]), maxQty);
+}
+
+function adjustItemMarkQty(itemName, delta, maxQty) {
+  const current = getItemMarkQty(itemName, maxQty);
+  const next = Math.min(Math.max(1, current + delta), maxQty);
+  stationCardQuantities[itemName] = next;
+  renderItemsStation();
+}
+
+function setItemMarkQty(itemName, val, maxQty) {
+  const parsed = parseInt(val, 10);
+  if (isNaN(parsed)) return;
+  stationCardQuantities[itemName] = Math.min(Math.max(1, parsed), maxQty);
+  renderItemsStation();
+}
+
+async function markCustomItemQty(itemName, isApi = false) {
+  const item = (detailedQueueItems || []).find(it => it.name === itemName);
+  const maxQty = item ? (item.pending_quantity || 0) : 1;
+  const count = getItemMarkQty(itemName, maxQty);
+  await updateBatchItemStatus(itemName, 'made', isApi, count);
+}
+
+async function reopenItemQty(itemName, count, isApi = false) {
+  await updateBatchItemStatus(itemName, 'pending', isApi, count);
+}
+
+async function adjustItemStatusDelta(itemId, delta, syncToLightspeed = false) {
+  try {
+    const res = await fetch(`/api/items/${encodeURIComponent(itemId)}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quantity_delta: delta, sync_lightspeed: syncToLightspeed })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.detailed_items) {
+        detailedQueueItems = data.detailed_items;
+        updateStationBadge();
+        if (currentMainView === 'items') {
+          renderItemsStation();
+        }
+      }
+      if (data.order) {
+        const idx = orders.findIndex(o => o.id === data.order.id);
+        if (idx !== -1) {
+          orders[idx] = data.order;
+        } else {
+          orders.unshift(data.order);
+        }
+        renderOrders();
+        fetchStats();
+        computeQueueSummary();
+      }
+      if (syncToLightspeed) {
+        showToast(`☁️ Item adjusted (${delta > 0 ? '+' : ''}${delta}) & synced with Lightspeed API`, 'success');
+      } else {
+        showToast(`🛡️ Item adjusted (${delta > 0 ? '+' : ''}${delta}) (Local only)`, 'info');
+      }
+    }
+  } catch (err) {
+    console.error("Failed to adjust item status:", err);
+    showToast("Failed to adjust item status", "error");
+  }
+}
+
+async function markLineRemaining(itemId, isApi = false) {
+  await updateItemStatus(itemId, 'made', isApi);
+}
+
 // Render dedicated Items Queue Station view
 function renderItemsStation() {
   const container = document.getElementById('items-station-container');
@@ -992,36 +1070,70 @@ function renderItemsStation() {
     const pendingCount = item.pending_quantity || 0;
     const madeCount = item.made_quantity || 0;
     const totalCount = item.total_quantity || (pendingCount + madeCount);
+    const selectedQty = getItemMarkQty(item.name, Math.max(1, pendingCount));
 
     const linesHtml = (item.order_lines || []).map(line => {
-      const isMade = line.item_status === 'made';
-      const syncBadge = isMade
-        ? (line.item_synced
-            ? '<span class="sync-status-pill synced" style="font-size: 10px; padding: 1px 6px;">☁️ Synced</span>'
-            : '<span class="sync-status-pill local" style="font-size: 10px; padding: 1px 6px;">🛡️ Local</span>')
+      const isComplete = (line.line_pending_quantity || 0) === 0;
+      const isPartiallyMade = (line.line_made_quantity || 0) > 0 && !isComplete;
+      const syncBadge = line.item_synced
+        ? '<span class="sync-status-pill synced" style="font-size: 10px; padding: 1px 6px;">☁️ Synced</span>'
+        : (line.line_made_quantity > 0 ? '<span class="sync-status-pill local" style="font-size: 10px; padding: 1px 6px;">🛡️ Local</span>' : '');
+
+      let actionButtons = '';
+      if (isComplete) {
+        actionButtons = `
+          <button class="action-btn-mini btn-secondary" onclick="updateItemStatus(${line.item_id}, 'pending', false)">
+            ↩ Reopen All
+          </button>
+          ${line.quantity > 1 ? `
+            <button class="action-btn-mini btn-secondary" onclick="adjustItemStatusDelta(${line.item_id}, -1, false)" title="Unmark 1 unit">
+              ↩ -1
+            </button>
+          ` : ''}
+        `;
+      } else {
+        if (line.quantity === 1) {
+          actionButtons = `
+            <button class="action-btn-mini btn-local-ready" onclick="updateItemStatus(${line.item_id}, 'made', false)" title="Mark item made on dashboard only">
+              🛡️ Made (Local)
+            </button>
+            <button class="action-btn-mini btn-api-ready" onclick="updateItemStatus(${line.item_id}, 'made', true)" title="Mark item made & sync to Lightspeed API">
+              ☁️ Made (API)
+            </button>
+          `;
+        } else {
+          actionButtons = `
+            <button class="action-btn-mini btn-local-ready" onclick="adjustItemStatusDelta(${line.item_id}, 1, false)" title="Mark 1 made locally">
+              🛡️ +1 Made (Local)
+            </button>
+            <button class="action-btn-mini btn-api-ready" onclick="adjustItemStatusDelta(${line.item_id}, 1, true)" title="Mark 1 made & sync Lightspeed API">
+              ☁️ +1 Made (API)
+            </button>
+            <button class="action-btn-mini btn-secondary" onclick="markLineRemaining(${line.item_id}, false)" title="Mark all remaining ${line.line_pending_quantity} made locally">
+              All (${line.line_pending_quantity})
+            </button>
+            ${line.line_made_quantity > 0 ? `
+              <button class="action-btn-mini btn-secondary" onclick="adjustItemStatusDelta(${line.item_id}, -1, false)" title="Unmark 1 made">
+                ↩ -1
+              </button>
+            ` : ''}
+          `;
+        }
+      }
+
+      const progressBadge = line.quantity > 1
+        ? `<span class="station-line-progress ${isComplete ? 'complete' : ''}">${line.line_made_quantity}/${line.quantity} made</span>`
         : '';
 
-      const actionButtons = isMade ? `
-        <button class="action-btn-mini btn-secondary" onclick="updateItemStatus(${line.item_id}, 'pending', false)">
-          ↩ Reopen
-        </button>
-      ` : `
-        <button class="action-btn-mini btn-local-ready" onclick="updateItemStatus(${line.item_id}, 'made', false)" title="Mark item made on dashboard only">
-          🛡️ Made (Local)
-        </button>
-        <button class="action-btn-mini btn-api-ready" onclick="updateItemStatus(${line.item_id}, 'made', true)" title="Mark item made & sync to Lightspeed API">
-          ☁️ Made (API)
-        </button>
-      `;
-
       return `
-        <li class="station-line-entry ${isMade ? 'is-made' : ''}">
+        <li class="station-line-entry ${isComplete ? 'is-made' : ''}">
           <div class="station-line-top">
             <div>
               <span class="station-order-tag">${escapeHtml(line.order_number || ('#' + line.order_id))}</span>
               <span class="station-cust-name">${escapeHtml(line.customer_name || 'Walk-in')}</span>
             </div>
             <div style="display: flex; align-items: center; gap: 6px;">
+              ${progressBadge}
               ${syncBadge}
               <span class="station-line-qty">×${line.quantity}</span>
             </div>
@@ -1034,20 +1146,55 @@ function renderItemsStation() {
       `;
     }).join('');
 
-    const batchFooter = pendingCount > 0 ? `
-      <div class="station-item-footer">
-        <button class="action-btn-mini btn-local-ready" style="flex: 1; justify-content: center;" onclick="updateBatchItemStatus('${escapeHtml(item.name).replace(/'/g, "\\'")}', 'made', false)" title="Mark all ${pendingCount} made locally">
-          🛡️ All Made (Local)
-        </button>
-        <button class="action-btn-mini btn-api-ready" style="flex: 1; justify-content: center;" onclick="updateBatchItemStatus('${escapeHtml(item.name).replace(/'/g, "\\'")}', 'made', true)" title="Mark all ${pendingCount} made and sync API">
-          ☁️ All Made (API)
-        </button>
-      </div>
-    ` : `
-      <div class="station-item-footer" style="justify-content: center; color: var(--accent-emerald); font-size: 12px; font-weight: 700; padding: 10px;">
-        ✅ All ${totalCount} completed
-      </div>
-    `;
+    const escapedName = escapeHtml(item.name).replace(/'/g, "\\'");
+    let batchFooter = '';
+
+    if (pendingCount > 0) {
+      batchFooter = `
+        <div class="station-item-footer">
+          <div class="station-qty-picker-row">
+            <span class="station-qty-label">Mark Quantity:</span>
+            <div class="station-qty-stepper-group">
+              <div class="station-qty-stepper">
+                <button type="button" class="qty-btn" onclick="adjustItemMarkQty('${escapedName}', -1, ${pendingCount})">−</button>
+                <input type="number" class="qty-input" value="${selectedQty}" min="1" max="${pendingCount}" onchange="setItemMarkQty('${escapedName}', this.value, ${pendingCount})" />
+                <button type="button" class="qty-btn" onclick="adjustItemMarkQty('${escapedName}', 1, ${pendingCount})">+</button>
+              </div>
+              <div class="station-qty-shortcuts">
+                ${pendingCount > 1 ? `<button type="button" class="shortcut-chip ${selectedQty === 1 ? 'active' : ''}" onclick="setItemMarkQty('${escapedName}', 1, ${pendingCount})">1</button>` : ''}
+                ${pendingCount >= 2 ? `<button type="button" class="shortcut-chip ${selectedQty === 2 ? 'active' : ''}" onclick="setItemMarkQty('${escapedName}', 2, ${pendingCount})">2</button>` : ''}
+                ${pendingCount >= 5 ? `<button type="button" class="shortcut-chip ${selectedQty === 5 ? 'active' : ''}" onclick="setItemMarkQty('${escapedName}', 5, ${pendingCount})">5</button>` : ''}
+                ${pendingCount > 2 ? `<button type="button" class="shortcut-chip ${selectedQty === pendingCount ? 'active' : ''}" onclick="setItemMarkQty('${escapedName}', ${pendingCount}, ${pendingCount})">All (${pendingCount})</button>` : ''}
+              </div>
+            </div>
+          </div>
+          <div class="station-action-buttons-row">
+            <button class="action-btn-mini btn-local-ready" onclick="markCustomItemQty('${escapedName}', false)" title="Mark ${selectedQty} made locally">
+              🛡️ Mark ${selectedQty} Made (Local)
+            </button>
+            <button class="action-btn-mini btn-api-ready" onclick="markCustomItemQty('${escapedName}', true)" title="Mark ${selectedQty} made and sync Lightspeed API">
+              ☁️ Mark ${selectedQty} Made (API)
+            </button>
+          </div>
+        </div>
+      `;
+    } else {
+      batchFooter = `
+        <div class="station-item-footer" style="padding: 10px 18px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+            <span style="color: var(--accent-emerald); font-size: 12px; font-weight: 700;">✅ All ${totalCount} completed</span>
+            <div style="display: flex; gap: 6px;">
+              <button class="action-btn-mini btn-secondary" onclick="reopenItemQty('${escapedName}', 1, false)" title="Reopen 1 unit back to pending">
+                ↩ Reopen 1
+              </button>
+              <button class="action-btn-mini btn-secondary" onclick="reopenItemQty('${escapedName}', ${totalCount}, false)" title="Reopen all back to pending">
+                ↩ Reopen All
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
 
     return `
       <div class="station-item-card">
@@ -1073,12 +1220,13 @@ function renderItemsStation() {
 }
 
 // Update individual item status via API (Local or Lightspeed synced)
-async function updateItemStatus(itemId, newStatus, syncToLightspeed = false) {
+async function updateItemStatus(itemId, newStatus, syncToLightspeed = false, options = {}) {
   try {
+    const payload = { status: newStatus, sync_lightspeed: syncToLightspeed, ...options };
     const res = await fetch(`/api/items/${encodeURIComponent(itemId)}/status`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: newStatus, sync_lightspeed: syncToLightspeed })
+      body: JSON.stringify(payload)
     });
     if (res.ok) {
       const data = await res.json();
@@ -1113,13 +1261,17 @@ async function updateItemStatus(itemId, newStatus, syncToLightspeed = false) {
   }
 }
 
-// Batch update all units of an item by name
-async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = false) {
+// Batch update units of an item by name (supports custom count or all)
+async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = false, count = null) {
   try {
+    const payload = { name: itemName, status: newStatus, sync_lightspeed: syncToLightspeed };
+    if (count !== null && count !== undefined) {
+      payload.count = count;
+    }
     const res = await fetch('/api/items/batch-status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: itemName, status: newStatus, sync_lightspeed: syncToLightspeed })
+      body: JSON.stringify(payload)
     });
     if (res.ok) {
       const data = await res.json();
@@ -1132,10 +1284,11 @@ async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = fal
       }
       fetchOrders();
       fetchStats();
+      const countLabel = count ? `${count} ` : 'All ';
       if (syncToLightspeed) {
-        showToast(`☁️ All "${itemName}" marked as ${newStatus} & synced with Lightspeed API`, 'success');
+        showToast(`☁️ ${countLabel}"${itemName}" marked as ${newStatus} & synced with Lightspeed API`, 'success');
       } else {
-        showToast(`🛡️ All "${itemName}" marked as ${newStatus} (Local only)`, 'info');
+        showToast(`🛡️ ${countLabel}"${itemName}" marked as ${newStatus} (Local only)`, 'info');
       }
     }
   } catch (err) {

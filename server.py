@@ -305,14 +305,21 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             item_id = int(parts[3])
             new_status = data.get('status', 'made')
             sync_lightspeed = bool(data.get('sync_lightspeed', False))
+            quantity_delta = data.get('quantity_delta')
+            count = data.get('count')
 
             api_result = None
             if sync_lightspeed:
                 settings = get_settings()
-                success, msg, is_sim = update_lightspeed_sale_status(settings, f"item-{item_id}", new_status)
+                desc = f"item-{item_id}"
+                if count:
+                    desc += f" (count: {count})"
+                elif quantity_delta:
+                    desc += f" (delta: {quantity_delta})"
+                success, msg, is_sim = update_lightspeed_sale_status(settings, desc, new_status)
                 api_result = {'success': success, 'message': msg, 'simulated': is_sim}
 
-            updated_order = update_item_status(item_id, new_status, synced_to_lightspeed=sync_lightspeed)
+            updated_order = update_item_status(item_id, new_status, synced_to_lightspeed=sync_lightspeed, quantity_delta=quantity_delta, count=count)
             sse_manager.broadcast("queue_updated", get_active_queue_summary())
             sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
             if updated_order:
@@ -327,19 +334,26 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 2d. Batch Update Items by Name (e.g. Mark all Flat Whites made)
+        # 2d. Batch Update Items by Name (supports custom count or all)
         if path == '/api/items/batch-status':
             item_name = data.get('name')
             new_status = data.get('status', 'made')
+            count = data.get('count')
+            if count is not None:
+                try:
+                    count = int(count)
+                except (ValueError, TypeError):
+                    count = None
             sync_lightspeed = bool(data.get('sync_lightspeed', False))
 
             api_result = None
             if sync_lightspeed:
                 settings = get_settings()
-                success, msg, is_sim = update_lightspeed_sale_status(settings, item_name, new_status)
+                target_desc = f"{count}x {item_name}" if count else item_name
+                success, msg, is_sim = update_lightspeed_sale_status(settings, target_desc, new_status)
                 api_result = {'success': success, 'message': msg, 'simulated': is_sim}
 
-            update_items_by_name(item_name, new_status, synced_to_lightspeed=sync_lightspeed)
+            update_items_by_name(item_name, count_to_mark=count, new_status=new_status, synced_to_lightspeed=sync_lightspeed)
             sse_manager.broadcast("queue_updated", get_active_queue_summary())
             sse_manager.broadcast("detailed_queue_updated", get_detailed_queue_items())
             sse_manager.broadcast("stats_updated", get_stats())
