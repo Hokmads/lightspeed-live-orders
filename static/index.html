@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lightspeed Live Orders Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%22%20%220%22%20%22100%22%20%22100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+</head>
+<body>
+
+  <!-- Top Header Navigation -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo">LS</div>
+      <div class="brand-info">
+        <h1>Live Order Stream</h1>
+        <p>Real-time Lightspeed POS &amp; eCommerce feed</p>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <!-- Live SSE Connection Badge -->
+      <div id="live-status-badge" class="live-badge connecting">
+        <span class="pulse-dot"></span>
+        <span id="live-status-text">CONNECTING...</span>
+      </div>
+
+      <!-- Audio Alert Toggle -->
+      <button id="sound-toggle-btn" class="btn btn-secondary" onclick="toggleSound()" title="Toggle Order Chime">
+        🔊 Sound On
+      </button>
+
+      <!-- Simulate Order Button -->
+      <button class="btn btn-success" onclick="simulateOrder()" title="Simulate an incoming Lightspeed order">
+        ⚡ Simulate Order
+      </button>
+
+      <!-- Lightspeed API Settings Modal Trigger -->
+      <button class="btn btn-secondary" onclick="openSettingsModal()" title="Lightspeed API Settings">
+        ⚙️ Settings &amp; API
+      </button>
+
+      <!-- Clear Orders Trigger -->
+      <button class="btn btn-danger btn-icon" onclick="clearAllOrders()" title="Clear orders">
+        🗑️
+      </button>
+    </div>
+  </header>
+
+  <!-- Live Stats KPI Bar -->
+  <section class="stats-container">
+    <div class="stat-card">
+      <span class="stat-title">Today's Orders</span>
+      <span class="stat-value" id="stat-today-orders">0</span>
+      <span class="stat-desc">Live from Lightspeed</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-title">Today's Revenue</span>
+      <span class="stat-value" id="stat-today-revenue">$0.00</span>
+      <span class="stat-desc">Gross sales today</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-title">New / Pending</span>
+      <span class="stat-value" id="stat-pending-orders" style="color: #60a5fa;">0</span>
+      <span class="stat-desc">Awaiting action</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-title">In Progress</span>
+      <span class="stat-value" id="stat-in-progress-orders" style="color: #fbbf24;">0</span>
+      <span class="stat-desc">Currently preparing</span>
+    </div>
+  </section>
+
+  <!-- Filter Tabs and Search Bar -->
+  <section class="controls-bar">
+    <div class="filter-tabs">
+      <button class="tab-btn active" data-status="all">
+        All <span class="tab-badge" id="tab-count-all">0</span>
+      </button>
+      <button class="tab-btn" data-status="new">
+        New <span class="tab-badge" id="tab-count-new">0</span>
+      </button>
+      <button class="tab-btn" data-status="in_progress">
+        In Progress <span class="tab-badge" id="tab-count-in_progress">0</span>
+      </button>
+      <button class="tab-btn" data-status="ready">
+        Ready <span class="tab-badge" id="tab-count-ready">0</span>
+      </button>
+      <button class="tab-btn" data-status="completed">
+        Completed <span class="tab-badge" id="tab-count-completed">0</span>
+      </button>
+    </div>
+
+    <div class="search-and-view">
+      <div class="search-box">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+        </svg>
+        <input type="text" id="search-input" placeholder="Search order #, customer, item...">
+      </div>
+    </div>
+  </section>
+
+  <!-- Orders Display Grid -->
+  <main class="content-area">
+    <div id="orders-container" class="orders-grid">
+      <!-- Dynamically populated by app.js -->
+    </div>
+  </main>
+
+  <!-- Order Details Modal -->
+  <div id="order-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2 id="modal-order-number">Order Details</h2>
+        <button class="modal-close" onclick="closeOrderModal()">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-order-body">
+        <!-- Rendered by app.js -->
+      </div>
+      <div class="modal-footer" id="modal-order-footer">
+        <!-- Action buttons rendered by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings & Lightspeed Integration Modal -->
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Lightspeed API &amp; Webhook Setup</h2>
+        <button class="modal-close" onclick="closeSettingsModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="settings-form" onsubmit="saveSettings(event)" style="display: flex; flex-direction: column; gap: 16px;">
+          
+          <div class="form-group">
+            <label for="setting-platform">Lightspeed Product / System</label>
+            <select id="setting-platform" onchange="updatePlatformFields()">
+              <option value="r_series">Lightspeed Retail (R-Series / MerchantOS)</option>
+              <option value="x_series">Lightspeed Retail (X-Series / Vend)</option>
+              <option value="webhook_only">Webhook Only (Direct Event Push)</option>
+            </select>
+            <span class="form-hint">Choose your active Lightspeed POS system.</span>
+          </div>
+
+          <div class="form-group" id="group-account-id">
+            <label for="setting-account-id">Account ID (R-Series)</label>
+            <input type="text" id="setting-account-id" placeholder="e.g. 123456">
+            <span class="form-hint">Found in your Lightspeed Retail URL (e.g. cloud.lightspeedapp.com/?accountId=123456).</span>
+          </div>
+
+          <div class="form-group" id="group-domain-prefix" style="display: none;">
+            <label for="setting-domain-prefix">Store Domain Prefix (X-Series / Vend)</label>
+            <input type="text" id="setting-domain-prefix" placeholder="e.g. mystore (from mystore.vendhq.com)">
+            <span class="form-hint">The subdomain of your Vend / X-Series store.</span>
+          </div>
+
+          <div class="form-group">
+            <label for="setting-api-token">API Bearer Token / Personal Access Token</label>
+            <input type="password" id="setting-api-token" placeholder="Enter your token...">
+            <span class="form-hint">Generated in Lightspeed Backoffice &gt; Settings &gt; Developer API.</span>
+          </div>
+
+          <div style="display: flex; align-items: center; justify-content: space-between; background: var(--bg-primary); padding: 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color);">
+            <div>
+              <div style="font-size: 13px; font-weight: 600;">Enable Automatic API Polling</div>
+              <div style="font-size: 11px; color: var(--text-muted);">Periodically checks Lightspeed API for newly submitted sales.</div>
+            </div>
+            <input type="checkbox" id="setting-polling" style="width: 18px; height: 18px; cursor: pointer;">
+          </div>
+
+          <div class="form-group">
+            <label for="setting-interval">Polling Interval (Seconds)</label>
+            <input type="number" id="setting-interval" min="5" max="300" value="15">
+            <span class="form-hint">How often to poll Lightspeed for updates (recommended: 10 - 30 seconds).</span>
+          </div>
+
+          <div style="border-top: 1px solid var(--border-color); padding-top: 14px;">
+            <label style="font-size: 13px; font-weight: 600; display: block; margin-bottom: 6px;">Instant Webhook Receiver URL</label>
+            <div class="webhook-box">
+              <span id="webhook-display-url">http://localhost:8080/api/webhooks/lightspeed</span>
+              <button type="button" class="btn btn-secondary" onclick="copyWebhookUrl()" style="padding: 4px 10px; font-size: 11px;">
+                📋 Copy
+              </button>
+            </div>
+            <span class="form-hint" style="margin-top: 6px; display: block;">
+              Configure this Webhook in Lightspeed Backoffice (or via webhook tunnel like ngrok/cloudflared) for instantaneous, zero-delay push updates!
+            </span>
+          </div>
+
+          <div id="test-result-box" style="display: none; padding: 10px; border-radius: var(--radius-md); font-size: 13px; background: var(--bg-primary); border: 1px solid var(--border-color);"></div>
+
+          <div style="display: flex; gap: 10px; justify-content: space-between; align-items: center; margin-top: 8px;">
+            <button type="button" id="test-conn-btn" class="btn btn-secondary" onclick="testApiConnection()">
+              🔌 Test Connection
+            </button>
+            <button type="submit" id="save-settings-btn" class="btn btn-primary">
+              Save Configuration
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
