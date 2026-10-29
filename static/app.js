@@ -16,6 +16,27 @@ let currentModalOrderId = null;
 let selectedQueueItem = null;
 let activeQueueItems = [];
 let detailedQueueItems = [];
+let colsPerRow = localStorage.getItem('ls_cols_per_row') || 'auto';
+
+// Set how many order/station cards fit per row and scale them accordingly
+function setColsPerRow(cols) {
+  const value = String(cols || 'auto');
+  colsPerRow = value;
+  localStorage.setItem('ls_cols_per_row', value);
+
+  const ordersGrid = document.getElementById('orders-container');
+  const itemsGrid = document.getElementById('items-station-container');
+  if (ordersGrid) {
+    ordersGrid.setAttribute('data-cols', value);
+  }
+  if (itemsGrid) {
+    itemsGrid.setAttribute('data-cols', value);
+  }
+
+  document.querySelectorAll('#cols-per-row-control .col-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.cols === value);
+  });
+}
 
 // Initialize Web Audio Context
 let audioCtx = null;
@@ -1358,6 +1379,7 @@ async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = fal
 
 // Setup Event Listeners and Timers
 document.addEventListener('DOMContentLoaded', () => {
+  setColsPerRow(colsPerRow);
   fetchOrders();
   fetchDetailedQueueItems();
   fetchStats();

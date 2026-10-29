@@ -118,6 +118,18 @@
     </div>
 
     <div class="search-and-view">
+      <!-- Orders Per Row Selector -->
+      <div class="cols-selector" id="cols-per-row-control" title="Choose how many orders fit on each row">
+        <span class="cols-label">Per Row:</span>
+        <button type="button" class="col-btn active" data-cols="auto" onclick="setColsPerRow('auto')">Auto</button>
+        <button type="button" class="col-btn" data-cols="1" onclick="setColsPerRow('1')">1</button>
+        <button type="button" class="col-btn" data-cols="2" onclick="setColsPerRow('2')">2</button>
+        <button type="button" class="col-btn" data-cols="3" onclick="setColsPerRow('3')">3</button>
+        <button type="button" class="col-btn" data-cols="4" onclick="setColsPerRow('4')">4</button>
+        <button type="button" class="col-btn" data-cols="5" onclick="setColsPerRow('5')">5</button>
+        <button type="button" class="col-btn" data-cols="6" onclick="setColsPerRow('6')">6</button>
+      </div>
+
       <div class="search-box">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
