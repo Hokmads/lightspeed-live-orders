@@ -19,7 +19,8 @@ from db import (
     get_stats, clear_all_orders, get_active_queue_summary,
     get_detailed_queue_items, update_item_status, update_items_by_name,
     authenticate_user, get_user_by_token, revoke_session,
-    list_users, create_user, update_user_password, delete_user
+    list_users, create_user, update_user_password, delete_user,
+    get_users_vault, merge_users_vault
 )
 from lightspeed import (
     normalize_webhook_payload, test_api_connection,
@@ -489,12 +490,15 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
 
         # 8. Auth: Login
         if path == '/api/auth/login':
+            if isinstance(data.get('users_vault'), list):
+                merge_users_vault(data.get('users_vault'))
             username = data.get('username', '')
             password = data.get('password', '')
             auth_res = authenticate_user(username, password)
             if not auth_res:
                 self.send_json_response(401, {'error': 'Invalid username or password.'})
                 return
+            auth_res['users_vault'] = get_users_vault()
             self.send_json_response(200, auth_res)
             return
 
@@ -505,10 +509,19 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(200, {'status': 'logged_out'})
             return
 
+        # 9b. Users Vault Sync
+        if path == '/api/users/sync':
+            if isinstance(data.get('users_vault'), list):
+                merge_users_vault(data.get('users_vault'))
+            self.send_json_response(200, {'status': 'synced', 'users_vault': get_users_vault()})
+            return
+
         # 10. Admin: Create User Account
         if path == '/api/users':
             if not self.require_admin():
                 return
+            if isinstance(data.get('users_vault'), list):
+                merge_users_vault(data.get('users_vault'))
             new_user, err = create_user(
                 username=data.get('username'),
                 password=data.get('password'),
@@ -518,7 +531,7 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             if err:
                 self.send_json_response(400, {'error': err})
                 return
-            self.send_json_response(201, {'user': new_user, 'users': list_users()})
+            self.send_json_response(201, {'user': new_user, 'users': list_users(), 'users_vault': get_users_vault()})
             return
 
         # 11. Admin: Delete User Account
@@ -532,7 +545,7 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_json_response(400, {'error': err})
                 return
-            self.send_json_response(200, {'status': 'deleted', 'users': list_users()})
+            self.send_json_response(200, {'status': 'deleted', 'users': list_users(), 'users_vault': get_users_vault()})
             return
 
         # 12. Admin: Update / Reset User Password
@@ -546,7 +559,7 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             if not ok:
                 self.send_json_response(400, {'error': err})
                 return
-            self.send_json_response(200, {'status': 'password_updated'})
+            self.send_json_response(200, {'status': 'password_updated', 'users_vault': get_users_vault()})
             return
 
         self.send_json_response(404, {'error': 'Endpoint not found'})

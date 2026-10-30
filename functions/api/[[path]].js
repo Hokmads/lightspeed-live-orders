@@ -1144,8 +1144,121 @@ async function pollLightspeedSales(settings) {
 }
 
 // ============================================================================
-// User & Session Auth Helpers (D1 + Memory Fallback)
+// User & Session Auth Helpers (D1 + Cloudflare Edge Cache + Stateless Tokens)
 // ============================================================================
+
+const EDGE_STATE_CACHE_URL = 'https://lightspeed-kds-edge-state.internal/__state_v2';
+const TOKEN_SIGNING_SECRET = 'ls-kds-edge-token-secret-2026-v1';
+
+async function loadEdgeCacheState() {
+  try {
+    if (typeof caches === 'undefined' || !caches.default) return;
+    const cacheReq = new Request(EDGE_STATE_CACHE_URL, { method: 'GET' });
+    const cachedRes = await caches.default.match(cacheReq);
+    if (!cachedRes) return;
+    const state = await cachedRes.json();
+    if (!state || typeof state !== 'object') return;
+
+    if (Array.isArray(state.users) && state.users.length > 0) {
+      // Merge cached users with any in-memory users
+      const byUsername = new Map();
+      for (const u of state.users) {
+        if (u && u.username) byUsername.set(u.username.toLowerCase(), u);
+      }
+      for (const u of memoryStore.users) {
+        if (u && u.username && !byUsername.has(u.username.toLowerCase())) {
+          byUsername.set(u.username.toLowerCase(), u);
+        }
+      }
+      const deletedSet = new Set((state.deletedUsernames || []).map(x => String(x).toLowerCase()));
+      memoryStore.users = Array.from(byUsername.values()).filter(u => !deletedSet.has(u.username.toLowerCase()));
+      memoryStore.deletedUsernames = Array.from(deletedSet);
+      const maxId = memoryStore.users.reduce((m, u) => Math.max(m, Number(u.id || 0)), 0);
+      memoryStore.nextUserId = Math.max(memoryStore.nextUserId, Number(state.nextUserId || 1), maxId + 1);
+    }
+
+    if (state.settings && typeof state.settings === 'object') {
+      memoryStore.settings = { ...memoryStore.settings, ...state.settings };
+    }
+
+    if (Array.isArray(state.orders) && memoryStore.orders.length === 0) {
+      memoryStore.orders = state.orders;
+    }
+    if (Array.isArray(state.order_items) && memoryStore.order_items.length === 0) {
+      memoryStore.order_items = state.order_items;
+      memoryStore.nextItemId = Math.max(memoryStore.nextItemId, Number(state.nextItemId || 1));
+    }
+  } catch (err) {
+    console.warn('Edge cache load warning:', err);
+  }
+}
+
+async function saveEdgeCacheState() {
+  try {
+    if (typeof caches === 'undefined' || !caches.default) return;
+    const cacheReq = new Request(EDGE_STATE_CACHE_URL, { method: 'GET' });
+    const payload = JSON.stringify({
+      users: memoryStore.users,
+      nextUserId: memoryStore.nextUserId,
+      deletedUsernames: memoryStore.deletedUsernames || [],
+      settings: memoryStore.settings,
+      orders: memoryStore.orders.slice(0, 150),
+      order_items: memoryStore.order_items.slice(0, 600),
+      nextItemId: memoryStore.nextItemId,
+      updatedAt: new Date().toISOString()
+    });
+    const res = new Response(payload, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=31536000'
+      }
+    });
+    await caches.default.put(cacheReq, res);
+  } catch (err) {
+    console.warn('Edge cache save warning:', err);
+  }
+}
+
+async function createSignedToken(user) {
+  const payloadObj = {
+    id: user.id,
+    username: user.username,
+    display_name: user.display_name,
+    role: user.role,
+    iat: Date.now()
+  };
+  const jsonStr = JSON.stringify(payloadObj);
+  const b64 = btoa(unescape(encodeURIComponent(jsonStr)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  const sig = await sha256Hex(`${b64}.${TOKEN_SIGNING_SECRET}`);
+  return `st.${b64}.${sig}`;
+}
+
+async function verifySignedToken(token) {
+  if (!token || !token.startsWith('st.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, b64, sig] = parts;
+  const expectedSig = await sha256Hex(`${b64}.${TOKEN_SIGNING_SECRET}`);
+  if (sig !== expectedSig) return null;
+  try {
+    const padded = b64.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonStr = decodeURIComponent(escape(atob(padded)));
+    const payload = JSON.parse(jsonStr);
+    if (!payload || !payload.username) return null;
+    return {
+      id: payload.id,
+      username: payload.username,
+      display_name: payload.display_name || payload.username,
+      role: payload.role === 'admin' ? 'admin' : 'staff'
+    };
+  } catch (_) {
+    return null;
+  }
+}
 
 async function ensureMemoryAdmin() {
   if (memoryStore.users.length === 0) {
@@ -1161,7 +1274,85 @@ async function ensureMemoryAdmin() {
   }
 }
 
-async function authenticateUser(db, username, password) {
+async function mergeUsersVault(db, vaultList) {
+  if (!Array.isArray(vaultList) || vaultList.length === 0) return;
+  if (!db) {
+    await ensureMemoryAdmin();
+    const deletedSet = new Set((memoryStore.deletedUsernames || []).map(x => String(x).toLowerCase()));
+    let changed = false;
+    for (const item of vaultList) {
+      if (!item || !item.username || !item.password_hash) continue;
+      const uname = String(item.username).trim().toLowerCase();
+      if (deletedSet.has(uname)) continue;
+      const existing = memoryStore.users.find(u => u.username.toLowerCase() === uname);
+      if (!existing) {
+        memoryStore.users.push({
+          id: item.id || memoryStore.nextUserId++,
+          username: uname,
+          display_name: item.display_name || uname,
+          password_hash: item.password_hash,
+          role: item.role === 'admin' ? 'admin' : 'staff',
+          created_at: item.created_at || new Date().toISOString()
+        });
+        changed = true;
+      } else if (item.updated_at && (!existing.updated_at || item.updated_at > existing.updated_at)) {
+        existing.password_hash = item.password_hash;
+        existing.display_name = item.display_name || existing.display_name;
+        existing.role = item.role === 'admin' ? 'admin' : 'staff';
+        existing.updated_at = item.updated_at;
+        changed = true;
+      }
+    }
+    if (changed) {
+      const maxId = memoryStore.users.reduce((m, u) => Math.max(m, Number(u.id || 0)), 0);
+      memoryStore.nextUserId = Math.max(memoryStore.nextUserId, maxId + 1);
+      await saveEdgeCacheState();
+    }
+    return;
+  }
+
+  await ensureD1Schema(db);
+  for (const item of vaultList) {
+    if (!item || !item.username || !item.password_hash) continue;
+    const uname = String(item.username).trim().toLowerCase();
+    const existing = await db.prepare(`SELECT id FROM users WHERE LOWER(username) = ?;`).bind(uname).first();
+    if (!existing) {
+      await db.prepare(`
+        INSERT OR IGNORE INTO users (username, display_name, password_hash, role, created_at)
+        VALUES (?, ?, ?, ?, ?);
+      `).bind(
+        uname,
+        item.display_name || uname,
+        item.password_hash,
+        item.role === 'admin' ? 'admin' : 'staff',
+        item.created_at || new Date().toISOString()
+      ).run();
+    }
+  }
+}
+
+async function getUsersVault(db) {
+  if (!db) {
+    await ensureMemoryAdmin();
+    return memoryStore.users.map(u => ({
+      id: u.id,
+      username: u.username,
+      display_name: u.display_name,
+      password_hash: u.password_hash,
+      role: u.role,
+      created_at: u.created_at,
+      updated_at: u.updated_at || u.created_at
+    }));
+  }
+  await ensureD1Schema(db);
+  const { results } = await db.prepare(`SELECT id, username, display_name, password_hash, role, created_at FROM users ORDER BY id ASC;`).all();
+  return results || [];
+}
+
+async function authenticateUser(db, username, password, clientVault = null) {
+  if (Array.isArray(clientVault) && clientVault.length > 0) {
+    await mergeUsersVault(db, clientVault);
+  }
   const cleanUser = String(username || '').trim().toLowerCase();
   if (!cleanUser || !password) return null;
 
@@ -1169,7 +1360,8 @@ async function authenticateUser(db, username, password) {
     await ensureMemoryAdmin();
     const row = memoryStore.users.find(u => u.username.toLowerCase() === cleanUser);
     if (!row || !(await verifyPassword(password, row.password_hash))) return null;
-    const token = randomHex(32);
+    const userObj = { id: row.id, username: row.username, display_name: row.display_name, role: row.role };
+    const token = await createSignedToken(userObj);
     const session = {
       token,
       user_id: row.id,
@@ -1179,9 +1371,11 @@ async function authenticateUser(db, username, password) {
       created_at: new Date().toISOString()
     };
     memoryStore.sessions.push(session);
+    await saveEdgeCacheState();
     return {
       token,
-      user: { id: row.id, username: row.username, display_name: row.display_name, role: row.role }
+      user: userObj,
+      users_vault: await getUsersVault(db)
     };
   }
 
@@ -1189,21 +1383,40 @@ async function authenticateUser(db, username, password) {
   const row = await db.prepare(`SELECT * FROM users WHERE LOWER(username) = ?;`).bind(cleanUser).first();
   if (!row || !(await verifyPassword(password, row.password_hash))) return null;
 
-  const token = randomHex(32);
+  const userObj = { id: row.id, username: row.username, display_name: row.display_name, role: row.role };
+  const token = await createSignedToken(userObj);
   const nowIso = new Date().toISOString();
   await db.prepare(`
-    INSERT INTO sessions (token, user_id, username, display_name, role, created_at)
+    INSERT OR REPLACE INTO sessions (token, user_id, username, display_name, role, created_at)
     VALUES (?, ?, ?, ?, ?, ?);
   `).bind(token, row.id, row.username, row.display_name, row.role, nowIso).run();
 
   return {
     token,
-    user: { id: row.id, username: row.username, display_name: row.display_name, role: row.role }
+    user: userObj,
+    users_vault: await getUsersVault(db)
   };
 }
 
 async function getUserByToken(db, token) {
   if (!token) return null;
+
+  // Verify stateless signed token first so Worker isolate restarts never drop active sessions
+  const signedUser = await verifySignedToken(token);
+  if (signedUser) {
+    if (!db) {
+      await ensureMemoryAdmin();
+      const u = memoryStore.users.find(x => x.username.toLowerCase() === signedUser.username.toLowerCase());
+      if (u) {
+        return { id: u.id, username: u.username, display_name: u.display_name, role: u.role };
+      }
+      return signedUser;
+    }
+    await ensureD1Schema(db);
+    const u = await db.prepare(`SELECT id, username, display_name, role FROM users WHERE LOWER(username) = ?;`).bind(signedUser.username.toLowerCase()).first();
+    return u || signedUser;
+  }
+
   if (!db) {
     await ensureMemoryAdmin();
     const s = memoryStore.sessions.find(x => x.token === token);
@@ -1226,6 +1439,7 @@ async function revokeSession(db, token) {
   if (!token) return;
   if (!db) {
     memoryStore.sessions = memoryStore.sessions.filter(s => s.token !== token);
+    await saveEdgeCacheState();
     return;
   }
   await ensureD1Schema(db);
@@ -1266,15 +1480,20 @@ async function createUser(db, { username, password, display_name, role = 'staff'
     if (memoryStore.users.some(u => u.username.toLowerCase() === cleanUsername)) {
       return { user: null, error: `Username '${cleanUsername}' already exists.` };
     }
+    if (Array.isArray(memoryStore.deletedUsernames)) {
+      memoryStore.deletedUsernames = memoryStore.deletedUsernames.filter(x => x !== cleanUsername);
+    }
     const u = {
       id: memoryStore.nextUserId++,
       username: cleanUsername,
       display_name: cleanDisplay,
       password_hash: pwHash,
       role: cleanRole,
-      created_at: nowIso
+      created_at: nowIso,
+      updated_at: nowIso
     };
     memoryStore.users.push(u);
+    await saveEdgeCacheState();
     return {
       user: { id: u.id, username: u.username, display_name: u.display_name, role: u.role, created_at: u.created_at },
       error: null
@@ -1314,6 +1533,8 @@ async function updateUserPassword(db, userId, newPassword) {
     const u = memoryStore.users.find(x => x.id === targetId);
     if (!u) return { ok: false, error: 'User not found.' };
     u.password_hash = pwHash;
+    u.updated_at = new Date().toISOString();
+    await saveEdgeCacheState();
     return { ok: true, error: null };
   }
   await ensureD1Schema(db);
@@ -1334,8 +1555,11 @@ async function deleteUser(db, userId, requestingUserId) {
       const admins = memoryStore.users.filter(x => x.role === 'admin');
       if (admins.length <= 1) return { ok: false, error: 'Cannot delete the last admin account.' };
     }
+    if (!Array.isArray(memoryStore.deletedUsernames)) memoryStore.deletedUsernames = [];
+    memoryStore.deletedUsernames.push(target.username.toLowerCase());
     memoryStore.sessions = memoryStore.sessions.filter(s => s.user_id !== targetId);
     memoryStore.users = memoryStore.users.filter(u => u.id !== targetId);
+    await saveEdgeCacheState();
     return { ok: true, error: null };
   }
   await ensureD1Schema(db);
@@ -1392,6 +1616,11 @@ export async function onRequest(context) {
         'Access-Control-Allow-Headers': 'Content-Type, X-Lightspeed-Signature, Authorization'
       }
     });
+  }
+
+  // Hydrate in-memory fallback from Cloudflare Edge Cache when D1 is not bound
+  if (!db) {
+    await loadEdgeCacheState();
   }
 
   // -------------------- GET ENDPOINTS --------------------
@@ -1480,7 +1709,11 @@ export async function onRequest(context) {
       const token = getAuthTokenFromRequest(request, url);
       const user = await getUserByToken(db, token);
       if (!user) return jsonResponse(401, { authenticated: false });
-      return jsonResponse(200, { authenticated: true, user });
+      return jsonResponse(200, {
+        authenticated: true,
+        user,
+        users_vault: await getUsersVault(db)
+      });
     }
 
     if (path === '/api/users') {
@@ -1488,7 +1721,10 @@ export async function onRequest(context) {
       const user = await getUserByToken(db, token);
       if (!user) return jsonResponse(401, { error: 'Authentication required.' });
       if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
-      return jsonResponse(200, { users: await listUsers(db) });
+      return jsonResponse(200, {
+        users: await listUsers(db),
+        users_vault: await getUsersVault(db)
+      });
     }
   }
 
@@ -1505,6 +1741,7 @@ export async function onRequest(context) {
     if (path === '/api/webhooks/lightspeed') {
       const normalized = normalizeWebhookPayload(data);
       const { savedOrder, isNew } = await saveOrder(db, normalized);
+      if (!db) await saveEdgeCacheState();
       return jsonResponse(200, {
         status: 'success',
         order_id: savedOrder.id,
@@ -1528,6 +1765,7 @@ export async function onRequest(context) {
       }
 
       const updated = await updateOrderStatus(db, orderId, newStatus, syncLightspeed);
+      if (!db) await saveEdgeCacheState();
       if (updated) {
         return jsonResponse(200, { order: updated, api_result: apiResult });
       }
@@ -1538,6 +1776,7 @@ export async function onRequest(context) {
       const parts = path.split('/');
       const orderId = decodeURIComponent(parts[3]);
       const updated = await updateOrderNotes(db, orderId, data.notes || '');
+      if (!db) await saveEdgeCacheState();
       if (updated) return jsonResponse(200, { order: updated });
       return jsonResponse(404, { error: 'Order not found' });
     }
@@ -1560,6 +1799,7 @@ export async function onRequest(context) {
       }
 
       const updatedOrder = await updateItemStatus(db, itemId, newStatus, syncLightspeed, quantityDelta, count);
+      if (!db) await saveEdgeCacheState();
       const detailedItems = await getDetailedQueueItems(db);
       return jsonResponse(200, {
         status: 'success',
@@ -1583,6 +1823,7 @@ export async function onRequest(context) {
       }
 
       await updateItemsByName(db, itemName, count, newStatus, syncLightspeed);
+      if (!db) await saveEdgeCacheState();
       const detailedItems = await getDetailedQueueItems(db);
       return jsonResponse(200, {
         status: 'success',
@@ -1594,6 +1835,7 @@ export async function onRequest(context) {
     if (path === '/api/simulate-order') {
       const mock = generateMockOrder();
       const { savedOrder } = await saveOrder(db, mock);
+      if (!db) await saveEdgeCacheState();
       return jsonResponse(201, { order: savedOrder });
     }
 
@@ -1609,6 +1851,7 @@ export async function onRequest(context) {
         data.api_token = current.api_token || '';
       }
       await updateSettings(db, data);
+      if (!db) await saveEdgeCacheState();
       return jsonResponse(200, { status: 'saved' });
     }
 
@@ -1635,16 +1878,18 @@ export async function onRequest(context) {
         const { isNew } = await saveOrder(db, sale);
         if (isNew) newCount++;
       }
+      if (!db) await saveEdgeCacheState();
       return jsonResponse(200, { synced_count: sales.length, new_count: newCount });
     }
 
     if (path === '/api/orders/clear') {
       await clearAllOrders(db);
+      if (!db) await saveEdgeCacheState();
       return jsonResponse(200, { status: 'cleared' });
     }
 
     if (path === '/api/auth/login') {
-      const authRes = await authenticateUser(db, data.username, data.password);
+      const authRes = await authenticateUser(db, data.username, data.password, data.users_vault);
       if (!authRes) {
         return jsonResponse(401, { error: 'Invalid username or password.' });
       }
@@ -1657,14 +1902,31 @@ export async function onRequest(context) {
       return jsonResponse(200, { status: 'logged_out' });
     }
 
+    if (path === '/api/users/sync') {
+      if (Array.isArray(data.users_vault)) {
+        await mergeUsersVault(db, data.users_vault);
+      }
+      return jsonResponse(200, {
+        status: 'synced',
+        users_vault: await getUsersVault(db)
+      });
+    }
+
     if (path === '/api/users') {
       const token = getAuthTokenFromRequest(request, url);
       const user = await getUserByToken(db, token);
       if (!user) return jsonResponse(401, { error: 'Authentication required.' });
       if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
+      if (Array.isArray(data.users_vault)) {
+        await mergeUsersVault(db, data.users_vault);
+      }
       const { user: created, error } = await createUser(db, data);
       if (error) return jsonResponse(400, { error });
-      return jsonResponse(201, { user: created, users: await listUsers(db) });
+      return jsonResponse(201, {
+        user: created,
+        users: await listUsers(db),
+        users_vault: await getUsersVault(db)
+      });
     }
 
     if (path.startsWith('/api/users/') && path.endsWith('/delete')) {
@@ -1676,7 +1938,11 @@ export async function onRequest(context) {
       const targetId = parseInt(parts[3], 10);
       const { ok, error } = await deleteUser(db, targetId, user.id);
       if (!ok) return jsonResponse(400, { error });
-      return jsonResponse(200, { status: 'deleted', users: await listUsers(db) });
+      return jsonResponse(200, {
+        status: 'deleted',
+        users: await listUsers(db),
+        users_vault: await getUsersVault(db)
+      });
     }
 
     if (path.startsWith('/api/users/') && path.endsWith('/password')) {
@@ -1688,7 +1954,10 @@ export async function onRequest(context) {
       const targetId = parseInt(parts[3], 10);
       const { ok, error } = await updateUserPassword(db, targetId, data.password || '');
       if (!ok) return jsonResponse(400, { error });
-      return jsonResponse(200, { status: 'password_updated' });
+      return jsonResponse(200, {
+        status: 'password_updated',
+        users_vault: await getUsersVault(db)
+      });
     }
   }
 

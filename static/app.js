@@ -1410,6 +1410,40 @@ async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = fal
 // Authentication & Admin User Management
 // ============================================================================
 
+function getStoredUsersVault() {
+  try {
+    const raw = localStorage.getItem('ls_users_vault');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveStoredUsersVault(vault) {
+  if (!Array.isArray(vault) || vault.length === 0) return;
+  try {
+    localStorage.setItem('ls_users_vault', JSON.stringify(vault));
+  } catch (_) {}
+}
+
+async function syncUsersVaultWithServer() {
+  const vault = getStoredUsersVault();
+  if (vault.length === 0) return;
+  try {
+    const res = await fetch('/api/users/sync', {
+      method: 'POST',
+      headers: getAuthHeaders(true),
+      body: JSON.stringify({ users_vault: vault })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.users_vault) saveStoredUsersVault(data.users_vault);
+    }
+  } catch (_) {}
+}
+
 function applyUserUIState() {
   const loginOverlay = document.getElementById('login-overlay');
   const sessionBox = document.getElementById('user-session-box');
@@ -1440,6 +1474,8 @@ function applyUserUIState() {
 }
 
 async function checkAuthSession() {
+  await syncUsersVaultWithServer();
+
   if (!authToken) {
     currentUser = null;
     applyUserUIState();
@@ -1450,8 +1486,10 @@ async function checkAuthSession() {
     const res = await fetch('/api/auth/me', { headers: getAuthHeaders(false) });
     if (res.ok) {
       const data = await res.json();
+      if (data.users_vault) saveStoredUsersVault(data.users_vault);
       if (data.authenticated && data.user) {
         currentUser = data.user;
+        localStorage.setItem('ls_current_user', JSON.stringify(currentUser));
         applyUserUIState();
         startDashboardSession();
         return;
@@ -1459,12 +1497,23 @@ async function checkAuthSession() {
     }
   } catch (err) {
     console.warn("Session check error:", err);
+    // Fallback to cached user if network/edge is temporarily unreachable
+    try {
+      const cachedUser = JSON.parse(localStorage.getItem('ls_current_user') || 'null');
+      if (cachedUser && cachedUser.username) {
+        currentUser = cachedUser;
+        applyUserUIState();
+        startDashboardSession();
+        return;
+      }
+    } catch (_) {}
   }
 
   // Invalid or expired token
   authToken = '';
   currentUser = null;
   localStorage.removeItem('ls_auth_token');
+  localStorage.removeItem('ls_current_user');
   applyUserUIState();
 }
 
@@ -1496,7 +1545,11 @@ async function handleLogin(e) {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({
+        username,
+        password,
+        users_vault: getStoredUsersVault()
+      })
     });
     const data = await res.json();
     if (!res.ok) {
@@ -1510,6 +1563,8 @@ async function handleLogin(e) {
     authToken = data.token;
     currentUser = data.user;
     localStorage.setItem('ls_auth_token', authToken);
+    localStorage.setItem('ls_current_user', JSON.stringify(currentUser));
+    if (data.users_vault) saveStoredUsersVault(data.users_vault);
     if (passwordInput) passwordInput.value = '';
     applyUserUIState();
     startDashboardSession();
@@ -1538,6 +1593,7 @@ async function logoutUser() {
   authToken = '';
   currentUser = null;
   localStorage.removeItem('ls_auth_token');
+  localStorage.removeItem('ls_current_user');
   closeSettingsModal();
   closeUsersModal();
   closeOrderModal();
@@ -1561,9 +1617,11 @@ function closeUsersModal() {
 
 async function fetchUsersList() {
   try {
+    await syncUsersVaultWithServer();
     const res = await fetch('/api/users', { headers: getAuthHeaders(false) });
     if (res.ok) {
       const data = await res.json();
+      if (data.users_vault) saveStoredUsersVault(data.users_vault);
       renderUsersList(data.users || []);
     }
   } catch (err) {
@@ -1617,7 +1675,8 @@ async function handleCreateUser(e) {
     username: (usernameEl?.value || '').trim(),
     display_name: (displayEl?.value || '').trim(),
     password: passwordEl?.value || '',
-    role: roleEl?.value || 'staff'
+    role: roleEl?.value || 'staff',
+    users_vault: getStoredUsersVault()
   };
 
   try {
@@ -1636,6 +1695,7 @@ async function handleCreateUser(e) {
     if (passwordEl) passwordEl.value = '';
     if (roleEl) roleEl.value = 'staff';
 
+    if (data.users_vault) saveStoredUsersVault(data.users_vault);
     if (data.users) renderUsersList(data.users);
     else fetchUsersList();
     showToast(`Account @${payload.username} created!`, 'success');
@@ -1660,6 +1720,7 @@ async function promptResetUserPassword(userId, username) {
     });
     const data = await res.json();
     if (res.ok) {
+      if (data.users_vault) saveStoredUsersVault(data.users_vault);
       showToast(`Password updated for @${username}`, 'success');
     } else {
       showToast(data.error || 'Failed to update password', 'error');
@@ -1678,6 +1739,11 @@ async function handleDeleteUser(userId, username) {
     });
     const data = await res.json();
     if (res.ok) {
+      if (data.users_vault) {
+        try {
+          localStorage.setItem('ls_users_vault', JSON.stringify(data.users_vault));
+        } catch (_) {}
+      }
       if (data.users) renderUsersList(data.users);
       else fetchUsersList();
       showToast(`Account @${username} removed`, 'info');

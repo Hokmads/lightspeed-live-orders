@@ -771,3 +771,35 @@ def delete_user(user_id, requesting_user_id=None):
     conn.commit()
     conn.close()
     return True, None
+
+def get_users_vault():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, display_name, password_hash, role, created_at FROM users ORDER BY id ASC;")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def merge_users_vault(vault_list):
+    if not isinstance(vault_list, list) or not vault_list:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    for item in vault_list:
+        if not isinstance(item, dict) or not item.get('username') or not item.get('password_hash'):
+            continue
+        uname = str(item['username']).strip().lower()
+        cursor.execute("SELECT id FROM users WHERE LOWER(username) = ?;", (uname,))
+        if not cursor.fetchone():
+            cursor.execute("""
+            INSERT OR IGNORE INTO users (username, display_name, password_hash, role, created_at)
+            VALUES (?, ?, ?, ?, ?);
+            """, (
+                uname,
+                item.get('display_name') or uname,
+                item['password_hash'],
+                'admin' if item.get('role') == 'admin' else 'staff',
+                item.get('created_at') or (datetime.datetime.utcnow().isoformat() + "Z")
+            ))
+    conn.commit()
+    conn.close()
