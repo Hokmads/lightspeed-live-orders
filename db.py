@@ -7,6 +7,8 @@ import sqlite3
 import json
 import os
 import datetime
+import hashlib
+import secrets
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'orders.db')
 
@@ -111,6 +113,42 @@ def init_db():
 
     for key, value in default_settings.items():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", (key, value))
+
+    # Users table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'staff',
+        created_at TEXT
+    );
+    """)
+
+    # Sessions table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """)
+
+    # Ensure default admin account exists
+    cursor.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin';")
+    admin_cnt = cursor.fetchone()['cnt']
+    if admin_cnt == 0:
+        now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+        default_hash = hash_password('admin123')
+        cursor.execute("""
+        INSERT OR IGNORE INTO users (username, display_name, password_hash, role, created_at)
+        VALUES (?, ?, ?, 'admin', ?);
+        """, ('admin', 'Administrator', default_hash, now_iso))
 
     conn.commit()
     conn.close()
@@ -584,3 +622,152 @@ def clear_all_orders():
     cursor.execute("DELETE FROM orders;")
     conn.commit()
     conn.close()
+
+# ============================================================================
+# User & Session Authentication Functions
+# ============================================================================
+
+def hash_password(password, salt=None):
+    if not salt:
+        salt = secrets.token_hex(16)
+    digest = hashlib.sha256(f"{salt}:{password}".encode('utf-8')).hexdigest()
+    return f"{salt}${digest}"
+
+def verify_password(password, stored_hash):
+    if not stored_hash or '$' not in stored_hash:
+        return False
+    salt, expected_digest = stored_hash.split('$', 1)
+    actual_digest = hashlib.sha256(f"{salt}:{password}".encode('utf-8')).hexdigest()
+    return secrets.compare_digest(actual_digest, expected_digest)
+
+def authenticate_user(username, password):
+    conn = get_connection()
+    cursor = conn.cursor()
+    clean_user = (username or '').strip().lower()
+    cursor.execute("SELECT * FROM users WHERE LOWER(username) = ?;", (clean_user,))
+    row = cursor.fetchone()
+    if not row or not verify_password(password or '', row['password_hash']):
+        conn.close()
+        return None
+
+    token = secrets.token_hex(32)
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    cursor.execute("""
+    INSERT INTO sessions (token, user_id, username, display_name, role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?);
+    """, (token, row['id'], row['username'], row['display_name'], row['role'], now_iso))
+    conn.commit()
+    conn.close()
+
+    return {
+        'token': token,
+        'user': {
+            'id': row['id'],
+            'username': row['username'],
+            'display_name': row['display_name'],
+            'role': row['role']
+        }
+    }
+
+def get_user_by_token(token):
+    if not token:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT u.id, u.username, u.display_name, u.role
+    FROM sessions s
+    JOIN users u ON s.user_id = u.id
+    WHERE s.token = ?;
+    """, (token,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return dict(row)
+
+def revoke_session(token):
+    if not token:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM sessions WHERE token = ?;", (token,))
+    conn.commit()
+    conn.close()
+
+def list_users():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, display_name, role, created_at FROM users ORDER BY id ASC;")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def create_user(username, password, display_name=None, role='staff'):
+    clean_username = (username or '').strip().lower()
+    if not clean_username or not password:
+        return None, "Username and password are required."
+    if len(password) < 4:
+        return None, "Password must be at least 4 characters."
+    clean_role = 'admin' if role == 'admin' else 'staff'
+    clean_display = (display_name or clean_username).strip()
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    pw_hash = hash_password(password)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE LOWER(username) = ?;", (clean_username,))
+    if cursor.fetchone():
+        conn.close()
+        return None, f"Username '{clean_username}' already exists."
+
+    cursor.execute("""
+    INSERT INTO users (username, display_name, password_hash, role, created_at)
+    VALUES (?, ?, ?, ?, ?);
+    """, (clean_username, clean_display, pw_hash, clean_role, now_iso))
+    user_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {
+        'id': user_id,
+        'username': clean_username,
+        'display_name': clean_display,
+        'role': clean_role,
+        'created_at': now_iso
+    }, None
+
+def update_user_password(user_id, new_password):
+    if not new_password or len(new_password) < 4:
+        return False, "Password must be at least 4 characters."
+    pw_hash = hash_password(new_password)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET password_hash = ? WHERE id = ?;", (pw_hash, int(user_id)))
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not updated:
+        return False, "User not found."
+    return True, None
+
+def delete_user(user_id, requesting_user_id=None):
+    target_id = int(user_id)
+    if requesting_user_id is not None and int(requesting_user_id) == target_id:
+        return False, "You cannot delete your own active account."
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, role FROM users WHERE id = ?;", (target_id,))
+    target = cursor.fetchone()
+    if not target:
+        conn.close()
+        return False, "User not found."
+    if target['role'] == 'admin':
+        cursor.execute("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin';")
+        if cursor.fetchone()['cnt'] <= 1:
+            conn.close()
+            return False, "Cannot delete the last admin account."
+    cursor.execute("DELETE FROM sessions WHERE user_id = ?;", (target_id,))
+    cursor.execute("DELETE FROM users WHERE id = ?;", (target_id,))
+    conn.commit()
+    conn.close()
+    return True, None

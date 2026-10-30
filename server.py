@@ -17,7 +17,9 @@ from db import (
     init_db, get_settings, update_settings, save_order,
     update_order_status, update_order_notes, get_order_by_id, list_orders,
     get_stats, clear_all_orders, get_active_queue_summary,
-    get_detailed_queue_items, update_item_status, update_items_by_name
+    get_detailed_queue_items, update_item_status, update_items_by_name,
+    authenticate_user, get_user_by_token, revoke_session,
+    list_users, create_user, update_user_password, delete_user
 )
 from lightspeed import (
     normalize_webhook_payload, test_api_connection,
@@ -130,6 +132,28 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Lightspeed-Signature, Authorization')
         self.end_headers()
 
+    def get_auth_token(self):
+        auth_header = self.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            return auth_header[7:].strip()
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        return query.get('token', [None])[0]
+
+    def get_current_user(self):
+        token = self.get_auth_token()
+        return get_user_by_token(token)
+
+    def require_admin(self):
+        user = self.get_current_user()
+        if not user:
+            self.send_json_response(401, {'error': 'Authentication required. Please sign in.'})
+            return None
+        if user.get('role') != 'admin':
+            self.send_json_response(403, {'error': 'Admin access required. Only the admin account can change API settings or manage users.'})
+            return None
+        return user
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -184,8 +208,10 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(200, {'items': get_detailed_queue_items()})
             return
 
-        # 5. REST API: Settings
+        # 5. REST API: Settings (Admin Only)
         if path == '/api/settings':
+            if not self.require_admin():
+                return
             settings = get_settings()
             # Mask API token for security in UI
             masked_token = settings.get('api_token', '')
@@ -195,6 +221,22 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             safe_settings['api_token_preview'] = masked_token
             safe_settings['has_api_token'] = bool(settings.get('api_token'))
             self.send_json_response(200, safe_settings)
+            return
+
+        # 5b. Auth: Current Session User
+        if path == '/api/auth/me':
+            user = self.get_current_user()
+            if not user:
+                self.send_json_response(401, {'authenticated': False})
+                return
+            self.send_json_response(200, {'authenticated': True, 'user': user})
+            return
+
+        # 5c. Admin: List Users
+        if path == '/api/users':
+            if not self.require_admin():
+                return
+            self.send_json_response(200, {'users': list_users()})
             return
 
         # 6. Static files (Frontend)
@@ -386,8 +428,10 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(201, {'order': saved_order})
             return
 
-        # 4. Save Settings
+        # 4. Save Settings (Admin Only)
         if path == '/api/settings':
+            if not self.require_admin():
+                return
             # Preserve existing token if user left it blank
             current = get_settings()
             if not data.get('api_token'):
@@ -397,8 +441,10 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response(200, {'status': 'saved'})
             return
 
-        # 5. Test API Connection
+        # 5. Test API Connection (Admin Only)
         if path == '/api/lightspeed/test-connection':
+            if not self.require_admin():
+                return
             current_settings = get_settings()
             # Merge with incoming payload in case testing unsaved inputs
             merged = dict(current_settings)
@@ -410,8 +456,10 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 6. Force Sync Now
+        # 6. Force Sync Now (Admin Only)
         if path == '/api/lightspeed/sync-now':
+            if not self.require_admin():
+                return
             settings = get_settings()
             sales = poll_lightspeed_sales(settings)
             count = 0
@@ -437,6 +485,68 @@ class LightspeedRequestHandler(http.server.BaseHTTPRequestHandler):
             sse_manager.broadcast("queue_updated", [])
             sse_manager.broadcast("detailed_queue_updated", [])
             self.send_json_response(200, {'status': 'cleared'})
+            return
+
+        # 8. Auth: Login
+        if path == '/api/auth/login':
+            username = data.get('username', '')
+            password = data.get('password', '')
+            auth_res = authenticate_user(username, password)
+            if not auth_res:
+                self.send_json_response(401, {'error': 'Invalid username or password.'})
+                return
+            self.send_json_response(200, auth_res)
+            return
+
+        # 9. Auth: Logout
+        if path == '/api/auth/logout':
+            token = self.get_auth_token()
+            revoke_session(token)
+            self.send_json_response(200, {'status': 'logged_out'})
+            return
+
+        # 10. Admin: Create User Account
+        if path == '/api/users':
+            if not self.require_admin():
+                return
+            new_user, err = create_user(
+                username=data.get('username'),
+                password=data.get('password'),
+                display_name=data.get('display_name'),
+                role=data.get('role', 'staff')
+            )
+            if err:
+                self.send_json_response(400, {'error': err})
+                return
+            self.send_json_response(201, {'user': new_user, 'users': list_users()})
+            return
+
+        # 11. Admin: Delete User Account
+        if path.startswith('/api/users/') and path.endswith('/delete'):
+            admin_user = self.require_admin()
+            if not admin_user:
+                return
+            parts = path.split('/')
+            target_id = int(parts[3])
+            ok, err = delete_user(target_id, requesting_user_id=admin_user['id'])
+            if not ok:
+                self.send_json_response(400, {'error': err})
+                return
+            self.send_json_response(200, {'status': 'deleted', 'users': list_users()})
+            return
+
+        # 12. Admin: Update / Reset User Password
+        if path.startswith('/api/users/') and path.endswith('/password'):
+            admin_user = self.require_admin()
+            if not admin_user:
+                return
+            parts = path.split('/')
+            target_id = int(parts[3])
+            ok, err = update_user_password(target_id, data.get('password', ''))
+            if not ok:
+                self.send_json_response(400, {'error': err})
+                return
+            self.send_json_response(200, {'status': 'password_updated'})
             return
 
         self.send_json_response(404, {'error': 'Endpoint not found'})

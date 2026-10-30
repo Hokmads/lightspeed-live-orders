@@ -39,8 +39,13 @@
         ⚡ Simulate Order
       </button>
 
-      <!-- Lightspeed API Settings Modal Trigger -->
-      <button class="btn btn-secondary" onclick="openSettingsModal()" title="Lightspeed API Settings">
+      <!-- Admin Only: Manage Users Modal Trigger -->
+      <button id="users-manage-btn" class="btn btn-secondary" onclick="openUsersModal()" title="Manage User Accounts (Admin Only)" style="display: none;">
+        👥 Users
+      </button>
+
+      <!-- Admin Only: Lightspeed API Settings Modal Trigger -->
+      <button id="settings-api-btn" class="btn btn-secondary" onclick="openSettingsModal()" title="Lightspeed API Settings (Admin Only)" style="display: none;">
         ⚙️ Settings &amp; API
       </button>
 
@@ -48,6 +53,14 @@
       <button class="btn btn-danger btn-icon" onclick="clearAllOrders()" title="Clear orders from screen (Local only — does NOT affect Lightspeed POS)">
         🗑️
       </button>
+
+      <!-- Signed-in User Badge & Logout -->
+      <div id="user-session-box" class="user-session-box" style="display: none;">
+        <span id="current-user-badge" class="user-role-pill">👤 User</span>
+        <button id="logout-btn" class="btn btn-secondary btn-logout" onclick="logoutUser()" title="Sign out of this account">
+          Sign Out
+        </button>
+      </div>
     </div>
   </header>
 
@@ -262,6 +275,86 @@
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin User Management Modal -->
+  <div id="users-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>👥 User Accounts &amp; Permissions</h2>
+        <button class="modal-close" onclick="closeUsersModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Create New User Form -->
+        <form id="create-user-form" onsubmit="handleCreateUser(event)" class="user-create-card">
+          <div class="user-create-title">➕ Create New Account</div>
+          <div class="user-form-grid">
+            <div class="form-group">
+              <label for="new-user-username">Username</label>
+              <input type="text" id="new-user-username" placeholder="e.g. kitchen1" required autocomplete="off">
+            </div>
+            <div class="form-group">
+              <label for="new-user-display">Display Name</label>
+              <input type="text" id="new-user-display" placeholder="e.g. Kitchen iPad" required autocomplete="off">
+            </div>
+            <div class="form-group">
+              <label for="new-user-password">Password</label>
+              <input type="password" id="new-user-password" placeholder="Min 4 characters" required autocomplete="new-password">
+            </div>
+            <div class="form-group">
+              <label for="new-user-role">Account Role</label>
+              <select id="new-user-role">
+                <option value="staff">Staff / KDS User (Cannot change API settings)</option>
+                <option value="admin">Admin (Full access + API settings &amp; users)</option>
+              </select>
+            </div>
+          </div>
+          <div style="display: flex; justify-content: flex-end; margin-top: 10px;">
+            <button type="submit" class="btn btn-primary">Create User Account</button>
+          </div>
+        </form>
+
+        <!-- Existing Users Table/List -->
+        <div>
+          <div style="font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); margin-bottom: 10px;">
+            Active Accounts
+          </div>
+          <div id="users-list-container" class="users-list-container">
+            <!-- Populated by app.js -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Full-Screen Authentication / Sign In Gate -->
+  <div id="login-overlay" class="login-overlay" style="display: none;">
+    <div class="login-card">
+      <div class="login-brand">
+        <div class="brand-logo" style="width: 44px; height: 44px; font-size: 20px;">LS</div>
+        <div>
+          <h2>Lightspeed Live Orders</h2>
+          <p>Sign in to access the live kitchen &amp; order stream</p>
+        </div>
+      </div>
+      <form id="login-form" onsubmit="handleLogin(event)" style="display: flex; flex-direction: column; gap: 14px;">
+        <div class="form-group">
+          <label for="login-username">Username</label>
+          <input type="text" id="login-username" placeholder="Enter username..." required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="login-password">Password</label>
+          <input type="password" id="login-password" placeholder="Enter password..." required autocomplete="current-password">
+        </div>
+        <div id="login-error-msg" class="login-error-msg" style="display: none;"></div>
+        <button type="submit" id="login-submit-btn" class="btn btn-primary" style="justify-content: center; padding: 11px; font-size: 14px; margin-top: 4px;">
+          🔒 Sign In
+        </button>
+      </form>
+      <div class="login-footer-hint">
+        🛡️ Only <strong>Admin</strong> accounts can access or modify Lightspeed API settings.
       </div>
     </div>
   </div>

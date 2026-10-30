@@ -17,6 +17,15 @@ let selectedQueueItem = null;
 let activeQueueItems = [];
 let detailedQueueItems = [];
 let colsPerRow = localStorage.getItem('ls_cols_per_row') || 'auto';
+let authToken = localStorage.getItem('ls_auth_token') || '';
+let currentUser = null;
+
+function getAuthHeaders(includeJson = true) {
+  const headers = {};
+  if (includeJson) headers['Content-Type'] = 'application/json';
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  return headers;
+}
 
 // Set how many order/station cards fit per row and scale them accordingly
 function setColsPerRow(cols) {
@@ -843,8 +852,12 @@ function updateSoundButtonUI() {
   }
 }
 
-// Settings Modal Management
+// Settings Modal Management (Admin Only)
 function openSettingsModal() {
+  if (!currentUser || currentUser.role !== 'admin') {
+    showToast('🔒 Only the Admin account can view or change API settings.', 'error');
+    return;
+  }
   loadSettings();
   document.getElementById('settings-modal').classList.add('active');
 }
@@ -855,7 +868,12 @@ function closeSettingsModal() {
 
 async function loadSettings() {
   try {
-    const res = await fetch('/api/settings');
+    const res = await fetch('/api/settings', { headers: getAuthHeaders(false) });
+    if (res.status === 401 || res.status === 403) {
+      showToast('🔒 Admin access required for API settings.', 'error');
+      closeSettingsModal();
+      return;
+    }
     const settings = await res.json();
     
     document.getElementById('setting-platform').value = settings.lightspeed_platform || 'r_series';
@@ -894,6 +912,10 @@ function updatePlatformFields() {
 
 async function saveSettings(e) {
   if (e) e.preventDefault();
+  if (!currentUser || currentUser.role !== 'admin') {
+    showToast('🔒 Only the Admin account can save API settings.', 'error');
+    return;
+  }
   const saveBtn = document.getElementById('save-settings-btn');
   saveBtn.disabled = true;
   saveBtn.textContent = 'Saving...';
@@ -910,12 +932,15 @@ async function saveSettings(e) {
   try {
     const res = await fetch('/api/settings', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(true),
       body: JSON.stringify(settingsData)
     });
     if (res.ok) {
       showToast('Settings saved successfully!', 'success');
       closeSettingsModal();
+    } else {
+      const errData = await res.json().catch(() => ({}));
+      showToast(errData.error || 'Failed to save settings', 'error');
     }
   } catch (err) {
     showToast('Failed to save settings', 'error');
@@ -926,6 +951,10 @@ async function saveSettings(e) {
 }
 
 async function testApiConnection() {
+  if (!currentUser || currentUser.role !== 'admin') {
+    showToast('🔒 Only the Admin account can test API settings.', 'error');
+    return;
+  }
   const testBtn = document.getElementById('test-conn-btn');
   const resultBox = document.getElementById('test-result-box');
   
@@ -943,7 +972,7 @@ async function testApiConnection() {
   try {
     const res = await fetch('/api/lightspeed/test-connection', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(true),
       body: JSON.stringify(testData)
     });
     const data = await res.json();
@@ -953,7 +982,7 @@ async function testApiConnection() {
       resultBox.textContent = `✅ ${data.message}`;
     } else {
       resultBox.style.color = '#ef4444';
-      resultBox.textContent = `❌ ${data.message}`;
+      resultBox.textContent = `❌ ${data.message || data.error || 'Connection test failed'}`;
     }
   } catch (err) {
     resultBox.style.display = 'block';
@@ -1377,14 +1406,294 @@ async function updateBatchItemStatus(itemName, newStatus, syncToLightspeed = fal
   }
 }
 
-// Setup Event Listeners and Timers
-document.addEventListener('DOMContentLoaded', () => {
-  setColsPerRow(colsPerRow);
+// ============================================================================
+// Authentication & Admin User Management
+// ============================================================================
+
+function applyUserUIState() {
+  const loginOverlay = document.getElementById('login-overlay');
+  const sessionBox = document.getElementById('user-session-box');
+  const userBadge = document.getElementById('current-user-badge');
+  const settingsBtn = document.getElementById('settings-api-btn');
+  const usersBtn = document.getElementById('users-manage-btn');
+
+  if (!currentUser) {
+    if (loginOverlay) loginOverlay.style.display = 'flex';
+    if (sessionBox) sessionBox.style.display = 'none';
+    if (settingsBtn) settingsBtn.style.display = 'none';
+    if (usersBtn) usersBtn.style.display = 'none';
+    return;
+  }
+
+  if (loginOverlay) loginOverlay.style.display = 'none';
+  if (sessionBox) sessionBox.style.display = 'inline-flex';
+
+  const isAdmin = currentUser.role === 'admin';
+  if (userBadge) {
+    userBadge.textContent = `${isAdmin ? '🛡️' : '👤'} ${currentUser.display_name || currentUser.username}`;
+    userBadge.classList.toggle('is-admin', isAdmin);
+  }
+
+  // Only Admin account can see/open API Settings or Users Management
+  if (settingsBtn) settingsBtn.style.display = isAdmin ? 'inline-flex' : 'none';
+  if (usersBtn) usersBtn.style.display = isAdmin ? 'inline-flex' : 'none';
+}
+
+async function checkAuthSession() {
+  if (!authToken) {
+    currentUser = null;
+    applyUserUIState();
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/auth/me', { headers: getAuthHeaders(false) });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.authenticated && data.user) {
+        currentUser = data.user;
+        applyUserUIState();
+        startDashboardSession();
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn("Session check error:", err);
+  }
+
+  // Invalid or expired token
+  authToken = '';
+  currentUser = null;
+  localStorage.removeItem('ls_auth_token');
+  applyUserUIState();
+}
+
+function startDashboardSession() {
   fetchOrders();
   fetchDetailedQueueItems();
   fetchStats();
   initSSE();
+}
+
+async function handleLogin(e) {
+  if (e) e.preventDefault();
+  const usernameInput = document.getElementById('login-username');
+  const passwordInput = document.getElementById('login-password');
+  const errorBox = document.getElementById('login-error-msg');
+  const submitBtn = document.getElementById('login-submit-btn');
+
+  const username = (usernameInput?.value || '').trim();
+  const password = passwordInput?.value || '';
+  if (!username || !password) return;
+
+  if (errorBox) errorBox.style.display = 'none';
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Signing in...';
+  }
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (errorBox) {
+        errorBox.textContent = data.error || 'Invalid username or password.';
+        errorBox.style.display = 'block';
+      }
+      return;
+    }
+
+    authToken = data.token;
+    currentUser = data.user;
+    localStorage.setItem('ls_auth_token', authToken);
+    if (passwordInput) passwordInput.value = '';
+    applyUserUIState();
+    startDashboardSession();
+    showToast(`Signed in as ${currentUser.display_name || currentUser.username}`, 'success');
+  } catch (err) {
+    if (errorBox) {
+      errorBox.textContent = 'Connection error while signing in.';
+      errorBox.style.display = 'block';
+    }
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = '🔒 Sign In';
+    }
+  }
+}
+
+async function logoutUser() {
+  try {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: getAuthHeaders(false)
+    });
+  } catch (_) {}
+
+  authToken = '';
+  currentUser = null;
+  localStorage.removeItem('ls_auth_token');
+  closeSettingsModal();
+  closeUsersModal();
+  closeOrderModal();
+  applyUserUIState();
+  showToast('Signed out', 'info');
+}
+
+function openUsersModal() {
+  if (!currentUser || currentUser.role !== 'admin') {
+    showToast('🔒 Only the Admin account can manage users.', 'error');
+    return;
+  }
+  fetchUsersList();
+  document.getElementById('users-modal').classList.add('active');
+}
+
+function closeUsersModal() {
+  const modal = document.getElementById('users-modal');
+  if (modal) modal.classList.remove('active');
+}
+
+async function fetchUsersList() {
+  try {
+    const res = await fetch('/api/users', { headers: getAuthHeaders(false) });
+    if (res.ok) {
+      const data = await res.json();
+      renderUsersList(data.users || []);
+    }
+  } catch (err) {
+    console.error("Failed to fetch users list:", err);
+  }
+}
+
+function renderUsersList(users) {
+  const container = document.getElementById('users-list-container');
+  if (!container) return;
+
+  if (!users || users.length === 0) {
+    container.innerHTML = `<div style="color: var(--text-muted); font-size: 12px;">No user accounts found.</div>`;
+    return;
+  }
+
+  container.innerHTML = users.map(u => {
+    const isSelf = currentUser && Number(currentUser.id) === Number(u.id);
+    const isAdmin = u.role === 'admin';
+    return `
+      <div class="user-row-item">
+        <div class="user-row-info">
+          <span class="user-row-name">${escapeHtml(u.display_name || u.username)}</span>
+          <span class="user-row-username">@${escapeHtml(u.username)}</span>
+          <span class="role-badge ${isAdmin ? 'admin' : 'staff'}">${isAdmin ? '🛡️ Admin (Full + API)' : '👨‍🍳 Staff / KDS'}</span>
+          ${isSelf ? `<span style="font-size: 11px; color: var(--text-muted);">(You)</span>` : ''}
+        </div>
+        <div class="user-row-actions">
+          <button type="button" class="btn btn-secondary" style="padding: 5px 10px; font-size: 11px;" onclick="promptResetUserPassword(${u.id}, '${escapeHtml(u.username).replace(/'/g, "\\'")}')">
+            🔑 Change Password
+          </button>
+          ${!isSelf ? `
+            <button type="button" class="btn btn-danger" style="padding: 5px 10px; font-size: 11px;" onclick="handleDeleteUser(${u.id}, '${escapeHtml(u.username).replace(/'/g, "\\'")}')">
+              🗑️ Remove
+            </button>
+          ` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function handleCreateUser(e) {
+  if (e) e.preventDefault();
+  const usernameEl = document.getElementById('new-user-username');
+  const displayEl = document.getElementById('new-user-display');
+  const passwordEl = document.getElementById('new-user-password');
+  const roleEl = document.getElementById('new-user-role');
+
+  const payload = {
+    username: (usernameEl?.value || '').trim(),
+    display_name: (displayEl?.value || '').trim(),
+    password: passwordEl?.value || '',
+    role: roleEl?.value || 'staff'
+  };
+
+  try {
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: getAuthHeaders(true),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.error || 'Failed to create user', 'error');
+      return;
+    }
+    if (usernameEl) usernameEl.value = '';
+    if (displayEl) displayEl.value = '';
+    if (passwordEl) passwordEl.value = '';
+    if (roleEl) roleEl.value = 'staff';
+
+    if (data.users) renderUsersList(data.users);
+    else fetchUsersList();
+    showToast(`Account @${payload.username} created!`, 'success');
+  } catch (err) {
+    showToast('Error creating user account', 'error');
+  }
+}
+
+async function promptResetUserPassword(userId, username) {
+  const newPassword = prompt(`Enter a new password for @${username} (minimum 4 characters):`);
+  if (newPassword === null) return;
+  if (newPassword.trim().length < 4) {
+    showToast('Password must be at least 4 characters.', 'error');
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/users/${encodeURIComponent(userId)}/password`, {
+      method: 'POST',
+      headers: getAuthHeaders(true),
+      body: JSON.stringify({ password: newPassword.trim() })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`Password updated for @${username}`, 'success');
+    } else {
+      showToast(data.error || 'Failed to update password', 'error');
+    }
+  } catch (err) {
+    showToast('Error updating password', 'error');
+  }
+}
+
+async function handleDeleteUser(userId, username) {
+  if (!confirm(`Remove user account @${username}?`)) return;
+  try {
+    const res = await fetch(`/api/users/${encodeURIComponent(userId)}/delete`, {
+      method: 'POST',
+      headers: getAuthHeaders(true)
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (data.users) renderUsersList(data.users);
+      else fetchUsersList();
+      showToast(`Account @${username} removed`, 'info');
+    } else {
+      showToast(data.error || 'Failed to delete user', 'error');
+    }
+  } catch (err) {
+    showToast('Error deleting user', 'error');
+  }
+}
+
+// Setup Event Listeners and Timers
+document.addEventListener('DOMContentLoaded', () => {
+  setColsPerRow(colsPerRow);
   updateSoundButtonUI();
+  checkAuthSession();
 
   // Filter tab buttons
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -1424,6 +1733,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') {
       closeOrderModal();
       closeSettingsModal();
+      closeUsersModal();
     }
   });
 
@@ -1432,6 +1742,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.target === overlay) {
         closeOrderModal();
         closeSettingsModal();
+        closeUsersModal();
       }
     });
   });

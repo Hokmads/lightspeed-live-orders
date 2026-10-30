@@ -13,6 +13,9 @@ const memoryStore = {
   orders: [],
   order_items: [],
   nextItemId: 1,
+  users: [],
+  nextUserId: 1,
+  sessions: [],
   settings: {
     lightspeed_platform: 'r_series',
     api_token: '',
@@ -26,6 +29,31 @@ const memoryStore = {
     last_sync_timestamp: ''
   }
 };
+
+function randomHex(byteCount = 16) {
+  const bytes = new Uint8Array(byteCount);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256Hex(str) {
+  const buf = new TextEncoder().encode(str);
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hashPassword(password, salt = null) {
+  const s = salt || randomHex(16);
+  const digest = await sha256Hex(`${s}:${password}`);
+  return `${s}$${digest}`;
+}
+
+async function verifyPassword(password, storedHash) {
+  if (!storedHash || !storedHash.includes('$')) return false;
+  const [salt, expected] = storedHash.split('$');
+  const actual = await sha256Hex(`${salt}:${password}`);
+  return actual === expected;
+}
 
 let d1Initialized = false;
 
@@ -95,6 +123,38 @@ async function ensureD1Schema(db) {
 
     for (const [k, v] of Object.entries(defaults)) {
       await db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);`).bind(k, v).run();
+    }
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'staff',
+        created_at TEXT
+      );
+    `).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT
+      );
+    `).run();
+
+    const adminRow = await db.prepare(`SELECT COUNT(*) as cnt FROM users WHERE role = 'admin';`).first();
+    if (!adminRow || !adminRow.cnt) {
+      const defaultHash = await hashPassword('admin123');
+      const nowIso = new Date().toISOString();
+      await db.prepare(`
+        INSERT OR IGNORE INTO users (username, display_name, password_hash, role, created_at)
+        VALUES ('admin', 'Administrator', ?, 'admin', ?);
+      `).bind(defaultHash, nowIso).run();
     }
 
     d1Initialized = true;
@@ -1084,6 +1144,223 @@ async function pollLightspeedSales(settings) {
 }
 
 // ============================================================================
+// User & Session Auth Helpers (D1 + Memory Fallback)
+// ============================================================================
+
+async function ensureMemoryAdmin() {
+  if (memoryStore.users.length === 0) {
+    const defaultHash = await hashPassword('admin123');
+    memoryStore.users.push({
+      id: memoryStore.nextUserId++,
+      username: 'admin',
+      display_name: 'Administrator',
+      password_hash: defaultHash,
+      role: 'admin',
+      created_at: new Date().toISOString()
+    });
+  }
+}
+
+async function authenticateUser(db, username, password) {
+  const cleanUser = String(username || '').trim().toLowerCase();
+  if (!cleanUser || !password) return null;
+
+  if (!db) {
+    await ensureMemoryAdmin();
+    const row = memoryStore.users.find(u => u.username.toLowerCase() === cleanUser);
+    if (!row || !(await verifyPassword(password, row.password_hash))) return null;
+    const token = randomHex(32);
+    const session = {
+      token,
+      user_id: row.id,
+      username: row.username,
+      display_name: row.display_name,
+      role: row.role,
+      created_at: new Date().toISOString()
+    };
+    memoryStore.sessions.push(session);
+    return {
+      token,
+      user: { id: row.id, username: row.username, display_name: row.display_name, role: row.role }
+    };
+  }
+
+  await ensureD1Schema(db);
+  const row = await db.prepare(`SELECT * FROM users WHERE LOWER(username) = ?;`).bind(cleanUser).first();
+  if (!row || !(await verifyPassword(password, row.password_hash))) return null;
+
+  const token = randomHex(32);
+  const nowIso = new Date().toISOString();
+  await db.prepare(`
+    INSERT INTO sessions (token, user_id, username, display_name, role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?);
+  `).bind(token, row.id, row.username, row.display_name, row.role, nowIso).run();
+
+  return {
+    token,
+    user: { id: row.id, username: row.username, display_name: row.display_name, role: row.role }
+  };
+}
+
+async function getUserByToken(db, token) {
+  if (!token) return null;
+  if (!db) {
+    await ensureMemoryAdmin();
+    const s = memoryStore.sessions.find(x => x.token === token);
+    if (!s) return null;
+    const u = memoryStore.users.find(x => x.id === s.user_id);
+    if (!u) return null;
+    return { id: u.id, username: u.username, display_name: u.display_name, role: u.role };
+  }
+  await ensureD1Schema(db);
+  const row = await db.prepare(`
+    SELECT u.id, u.username, u.display_name, u.role
+    FROM sessions s
+    JOIN users u ON s.user_id = u.id
+    WHERE s.token = ?;
+  `).bind(token).first();
+  return row || null;
+}
+
+async function revokeSession(db, token) {
+  if (!token) return;
+  if (!db) {
+    memoryStore.sessions = memoryStore.sessions.filter(s => s.token !== token);
+    return;
+  }
+  await ensureD1Schema(db);
+  await db.prepare(`DELETE FROM sessions WHERE token = ?;`).bind(token).run();
+}
+
+async function listUsers(db) {
+  if (!db) {
+    await ensureMemoryAdmin();
+    return memoryStore.users.map(u => ({
+      id: u.id,
+      username: u.username,
+      display_name: u.display_name,
+      role: u.role,
+      created_at: u.created_at
+    }));
+  }
+  await ensureD1Schema(db);
+  const { results } = await db.prepare(`SELECT id, username, display_name, role, created_at FROM users ORDER BY id ASC;`).all();
+  return results || [];
+}
+
+async function createUser(db, { username, password, display_name, role = 'staff' }) {
+  const cleanUsername = String(username || '').trim().toLowerCase();
+  if (!cleanUsername || !password) {
+    return { user: null, error: 'Username and password are required.' };
+  }
+  if (String(password).length < 4) {
+    return { user: null, error: 'Password must be at least 4 characters.' };
+  }
+  const cleanRole = role === 'admin' ? 'admin' : 'staff';
+  const cleanDisplay = String(display_name || cleanUsername).trim();
+  const nowIso = new Date().toISOString();
+  const pwHash = await hashPassword(password);
+
+  if (!db) {
+    await ensureMemoryAdmin();
+    if (memoryStore.users.some(u => u.username.toLowerCase() === cleanUsername)) {
+      return { user: null, error: `Username '${cleanUsername}' already exists.` };
+    }
+    const u = {
+      id: memoryStore.nextUserId++,
+      username: cleanUsername,
+      display_name: cleanDisplay,
+      password_hash: pwHash,
+      role: cleanRole,
+      created_at: nowIso
+    };
+    memoryStore.users.push(u);
+    return {
+      user: { id: u.id, username: u.username, display_name: u.display_name, role: u.role, created_at: u.created_at },
+      error: null
+    };
+  }
+
+  await ensureD1Schema(db);
+  const existing = await db.prepare(`SELECT id FROM users WHERE LOWER(username) = ?;`).bind(cleanUsername).first();
+  if (existing) {
+    return { user: null, error: `Username '${cleanUsername}' already exists.` };
+  }
+  const res = await db.prepare(`
+    INSERT INTO users (username, display_name, password_hash, role, created_at)
+    VALUES (?, ?, ?, ?, ?);
+  `).bind(cleanUsername, cleanDisplay, pwHash, cleanRole, nowIso).run();
+
+  return {
+    user: {
+      id: res.meta?.last_row_id,
+      username: cleanUsername,
+      display_name: cleanDisplay,
+      role: cleanRole,
+      created_at: nowIso
+    },
+    error: null
+  };
+}
+
+async function updateUserPassword(db, userId, newPassword) {
+  if (!newPassword || String(newPassword).length < 4) {
+    return { ok: false, error: 'Password must be at least 4 characters.' };
+  }
+  const pwHash = await hashPassword(newPassword);
+  const targetId = parseInt(userId, 10);
+  if (!db) {
+    await ensureMemoryAdmin();
+    const u = memoryStore.users.find(x => x.id === targetId);
+    if (!u) return { ok: false, error: 'User not found.' };
+    u.password_hash = pwHash;
+    return { ok: true, error: null };
+  }
+  await ensureD1Schema(db);
+  await db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?;`).bind(pwHash, targetId).run();
+  return { ok: true, error: null };
+}
+
+async function deleteUser(db, userId, requestingUserId) {
+  const targetId = parseInt(userId, 10);
+  if (requestingUserId !== undefined && parseInt(requestingUserId, 10) === targetId) {
+    return { ok: false, error: 'You cannot delete your own active account.' };
+  }
+  if (!db) {
+    await ensureMemoryAdmin();
+    const target = memoryStore.users.find(x => x.id === targetId);
+    if (!target) return { ok: false, error: 'User not found.' };
+    if (target.role === 'admin') {
+      const admins = memoryStore.users.filter(x => x.role === 'admin');
+      if (admins.length <= 1) return { ok: false, error: 'Cannot delete the last admin account.' };
+    }
+    memoryStore.sessions = memoryStore.sessions.filter(s => s.user_id !== targetId);
+    memoryStore.users = memoryStore.users.filter(u => u.id !== targetId);
+    return { ok: true, error: null };
+  }
+  await ensureD1Schema(db);
+  const target = await db.prepare(`SELECT id, username, role FROM users WHERE id = ?;`).bind(targetId).first();
+  if (!target) return { ok: false, error: 'User not found.' };
+  if (target.role === 'admin') {
+    const adminCnt = await db.prepare(`SELECT COUNT(*) as cnt FROM users WHERE role = 'admin';`).first();
+    if ((adminCnt?.cnt || 0) <= 1) {
+      return { ok: false, error: 'Cannot delete the last admin account.' };
+    }
+  }
+  await db.prepare(`DELETE FROM sessions WHERE user_id = ?;`).bind(targetId).run();
+  await db.prepare(`DELETE FROM users WHERE id = ?;`).bind(targetId).run();
+  return { ok: true, error: null };
+}
+
+function getAuthTokenFromRequest(request, url) {
+  const authHeader = request.headers.get('Authorization') || '';
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return url.searchParams.get('token') || null;
+}
+
+// ============================================================================
 // Main Cloudflare Pages Function Request Handler
 // ============================================================================
 
@@ -1181,6 +1458,12 @@ export async function onRequest(context) {
     }
 
     if (path === '/api/settings') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required. Please sign in.' });
+      if (user.role !== 'admin') {
+        return jsonResponse(403, { error: 'Admin access required. Only the admin account can change API settings.' });
+      }
       const settings = await getSettings(db);
       let masked = settings.api_token || '';
       if (masked && masked.length > 8) {
@@ -1191,6 +1474,21 @@ export async function onRequest(context) {
         api_token_preview: masked,
         has_api_token: Boolean(settings.api_token)
       });
+    }
+
+    if (path === '/api/auth/me') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { authenticated: false });
+      return jsonResponse(200, { authenticated: true, user });
+    }
+
+    if (path === '/api/users') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
+      return jsonResponse(200, { users: await listUsers(db) });
     }
   }
 
@@ -1300,6 +1598,12 @@ export async function onRequest(context) {
     }
 
     if (path === '/api/settings') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') {
+        return jsonResponse(403, { error: 'Admin access required. Only the admin account can change API settings.' });
+      }
       const current = await getSettings(db);
       if (!data.api_token) {
         data.api_token = current.api_token || '';
@@ -1309,6 +1613,10 @@ export async function onRequest(context) {
     }
 
     if (path === '/api/lightspeed/test-connection') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
       const current = await getSettings(db);
       const merged = { ...current, ...data };
       const res = await testApiConnection(merged);
@@ -1316,6 +1624,10 @@ export async function onRequest(context) {
     }
 
     if (path === '/api/lightspeed/sync-now') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
       const settings = await getSettings(db);
       const sales = await pollLightspeedSales(settings);
       let newCount = 0;
@@ -1329,6 +1641,54 @@ export async function onRequest(context) {
     if (path === '/api/orders/clear') {
       await clearAllOrders(db);
       return jsonResponse(200, { status: 'cleared' });
+    }
+
+    if (path === '/api/auth/login') {
+      const authRes = await authenticateUser(db, data.username, data.password);
+      if (!authRes) {
+        return jsonResponse(401, { error: 'Invalid username or password.' });
+      }
+      return jsonResponse(200, authRes);
+    }
+
+    if (path === '/api/auth/logout') {
+      const token = getAuthTokenFromRequest(request, url);
+      await revokeSession(db, token);
+      return jsonResponse(200, { status: 'logged_out' });
+    }
+
+    if (path === '/api/users') {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
+      const { user: created, error } = await createUser(db, data);
+      if (error) return jsonResponse(400, { error });
+      return jsonResponse(201, { user: created, users: await listUsers(db) });
+    }
+
+    if (path.startsWith('/api/users/') && path.endsWith('/delete')) {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
+      const parts = path.split('/');
+      const targetId = parseInt(parts[3], 10);
+      const { ok, error } = await deleteUser(db, targetId, user.id);
+      if (!ok) return jsonResponse(400, { error });
+      return jsonResponse(200, { status: 'deleted', users: await listUsers(db) });
+    }
+
+    if (path.startsWith('/api/users/') && path.endsWith('/password')) {
+      const token = getAuthTokenFromRequest(request, url);
+      const user = await getUserByToken(db, token);
+      if (!user) return jsonResponse(401, { error: 'Authentication required.' });
+      if (user.role !== 'admin') return jsonResponse(403, { error: 'Admin access required.' });
+      const parts = path.split('/');
+      const targetId = parseInt(parts[3], 10);
+      const { ok, error } = await updateUserPassword(db, targetId, data.password || '');
+      if (!ok) return jsonResponse(400, { error });
+      return jsonResponse(200, { status: 'password_updated' });
     }
   }
 
